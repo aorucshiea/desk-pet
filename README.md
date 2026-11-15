@@ -1,7 +1,7 @@
 <h1 align="center">Desk Pet AI</h1>
 
 <p align="center">
-  一只住在桌面上的本地优先 AI 桌宠：有记忆、有情绪，会自己决定要不要动。
+  一只住在桌面上的 桌宠生命：有记忆、有情绪，会自己决定要不要动。
 </p>
 
 <p align="center">
