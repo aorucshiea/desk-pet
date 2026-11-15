@@ -1,3 +1,4 @@
+项目有一些不完善功能，不建议盲目测试。或者至少先用免费网页额度。
 <h1 align="center">Desk Pet AI</h1>
 
 <p align="center">
