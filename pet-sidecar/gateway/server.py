@@ -6674,6 +6674,36 @@ async def _stream_chat_provider(
         # and the next_check_s frame is emitted right before the pipeline's
         # final end frame (see the tail of this generator).
 
+        # ── reflex 决策覆盖 D 先验采样 ──
+        # 用户裁定：D 的思考强度/持续反应/默认动作由直觉小模型决定，
+        # D 的先验采样只作参考。升级时用 reflex 的 reaction/think
+        # 覆盖 _decision，让主脑拿到小模型给的预算。
+        _decision["thinking"] = bool(_reflex_decision.get("think"))
+        _decision["reasoning_effort"] = (
+            "low" if _reflex_decision.get("think") else None
+        )
+        _decision["strength"] = (
+            "low" if _reflex_decision.get("think") else "no_thinking"
+        )
+        _decision["reaction"] = str(_reflex_decision.get("reaction") or "small")
+        _decision["max_tokens"] = _cortex.REACTION_MAX_TOKENS.get(
+            _decision["reaction"], 2048
+        )
+        _decision["action"] = str(_reflex_decision.get("action") or "quiet")
+        _decision["source"] = "reflex"
+        _decision["reason"] = (
+            f"reflex|{_reflex_decision.get('reason') or ''}"
+        )
+        log.info(
+            "reflex decision override: thinking=%s reaction=%s action=%s "
+            "max_tokens=%d reason=%s",
+            _decision["thinking"],
+            _decision["reaction"],
+            _decision["action"],
+            _decision["max_tokens"],
+            _decision["reason"],
+        )
+
     if (
         not _rx_gate_armed
         and not _pending_organize_kind

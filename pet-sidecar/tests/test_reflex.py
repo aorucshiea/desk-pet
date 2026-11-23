@@ -247,7 +247,7 @@ async def test_prefill_contract_request_shape():
     assert body["response_format"]["type"] == "json_schema"
     assert schema["name"] == "reflex"
     assert schema["strict"] is True
-    assert schema["schema"]["required"] == ["action", "think", "next_check_s", "reason"]
+    assert schema["schema"]["required"] == ["action", "think", "reaction", "next_check_s", "reason"]
     assert schema["schema"]["additionalProperties"] is False
     assert schema["schema"]["properties"]["action"]["enum"] == [
         "speak", "look", "walk", "quiet", "other",
@@ -445,6 +445,7 @@ async def test_disabled_config_never_sends_request():
     assert decision == {
         "action": "quiet",
         "think": False,
+        "reaction": "small",
         "next_check_s": 300,
         "reason": "",
         "source": "fallback",

@@ -122,10 +122,11 @@ _REFLEX_SCHEMA: Dict[str, Any] = {
     "properties": {
         "action": {"type": "string", "enum": list(ACTIONS)},
         "think": {"type": "boolean"},
+        "reaction": {"type": "string", "enum": ["small", "medium", "large"]},
         "next_check_s": {"type": "integer"},
         "reason": {"type": "string"},
     },
-    "required": ["action", "think", "next_check_s", "reason"],
+    "required": ["action", "think", "reaction", "next_check_s", "reason"],
     "additionalProperties": False,
 }
 _RESPONSE_FORMAT: Dict[str, Any] = {
@@ -139,9 +140,10 @@ _RESPONSE_FORMAT: Dict[str, Any] = {
 _SYSTEM_PROMPT = """你是桌宠的快直觉核心（潜意识）。职责：用一次便宜的状态判断决定这一拍怎么过——值得的事才唤醒大脑（主模型），安静的时候就让身体安静待着，不要为了存在感而行动。
 
 输出契约：只输出一个 JSON 对象，字段固定为：
-{"action": "speak"|"look"|"walk"|"quiet"|"other", "think": false, "next_check_s": 300, "reason": "不超过20字的中文理由"}
+{"action": "speak"|"look"|"walk"|"quiet"|"other", "think": false, "reaction": "small", "next_check_s": 300, "reason": "不超过20字的中文理由"}
 - action：这一拍身体做什么。speak=说一句话，look=看一眼周围，walk=走动，quiet=安静待着，other=其它小动作。
 - think：是否唤醒大脑做真正的思考。没有明确理由就是 false。
+- reaction：升级时大脑的持续反应力度。small=简短回应(1536 tok)、medium=中等(2560 tok)、large=深入(4096 tok)。quiet 时选 small。
 - next_check_s：距下次自查的秒数，必须落在当前节奏档内。
 - reason：最关键的一句话，不超过20个中文字；升级（非 quiet/非 think=false）时必须写出理由。
 
@@ -151,8 +153,9 @@ _SYSTEM_PROMPT = """你是桌宠的快直觉核心（潜意识）。职责：用
 校准指导：
 - 深夜安静、没有新事件、用户不在：action=quiet、think=false，next_check_s 靠近档位上限（slow 档取 330–360）。
 - 只有出现新事件、用户在场、或强烈的直觉时才升级 action 或 think=true；不要无缘无故地看或走。
+- 升级时根据事情的重要程度选 reaction：小事 small、需要认真回复 medium、复杂问题 large。
 - 不要连续多轮输出相同的 action；最近心声显示上一轮已做过某动作时，本轮换一种更合适的方式。
-- 拿不准就选更省的一项：quiet、think=false、档位内偏大的 next_check_s。"""
+- 拿不准就选更省的一项：quiet、think=false、reaction=small、档位内偏大的 next_check_s。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,9 +367,15 @@ def _validate_decision(data: Any, tier: str) -> Tuple[Optional[dict], str]:
     reason = str(raw_reason).strip() if raw_reason is not None else ""
     reason = reason[:_REASON_MAX_CHARS]
 
+    raw_reaction = data.get("reaction")
+    reaction = str(raw_reaction).strip().lower() if raw_reaction else "small"
+    if reaction not in ("small", "medium", "large"):
+        reaction = "small"
+
     return {
         "action": action,
         "think": think,
+        "reaction": reaction,
         "next_check_s": next_check,
         "reason": reason,
         "source": "reflex",
@@ -378,6 +387,8 @@ def _fallback(tier: str, failure: str) -> dict:
     lo, hi = TEMPO_RANGE_S[tier]
     return {
         "action": "quiet",
+        "think": False,
+        "reaction": "small",
         "think": False,
         "next_check_s": (lo + hi) // 2,
         "reason": "",
