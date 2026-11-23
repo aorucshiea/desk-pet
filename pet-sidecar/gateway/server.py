@@ -6252,6 +6252,12 @@ async def _stream_chat_provider(
                 "vitals: user speech wake (stage=%s think=%s hp=%.1f)",
                 _wake.get("stage"), bool(_wake.get("think")), _vitals0.hp,
             )
+            # 被吵醒≠醒来：AI 回应后还会继续睡（episode 延长），壳应保持
+            # sleeping 动画而不是切回 idle。只有自然醒才回 idle。
+            try:
+                bridge.post("sleeping")
+            except Exception:
+                pass
             try:
                 if _vitals0.died and _should_archive_death(_vitals0):
                     _grave_dir = _vitals_state_dir()
