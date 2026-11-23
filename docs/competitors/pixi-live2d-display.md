@@ -1,0 +1,23 @@
+# pixi-live2d-display
+
+- 仓库/文档：[GitHub guansss/pixi-live2d-display](https://github.com/guansss/pixi-live2d-display) · [官方文档](https://guansss.github.io/pixi-live2d-display) · [API 文档](https://guansss.github.io/pixi-live2d-display/api/index.html) · 星标：1,518（GitHub API 读数 2026-11-23）· 语言：TypeScript · 许可：**MIT（仅插件本体）**——Cubism Core 运行时是 Live2D 专有软件，见下 · 最近活跃：2024-08-20 push（截至 2026-11-23 已 2 年多无更新，维护停滞；npm 最新稳定版 0.4.0 发布于 2022-09-04，另有 0.5.0-beta 预发布——npm registry 2026-11-23 读数）
+- 一句话定位：Web 端事实标准的 Live2D 渲染库——把官方 Cubism Framework 重写成一套 Pixi 风格高层 API，一个插件统一渲染 Cubism 2.1/3/4 全部模型版本；凌凌 Electron 壳里画 Live2D 桌宠大概率就是它。
+- 架构要点：
+  1. **渲染路径**：PixiJS v6 插件，`Live2DModel.from(url)` 加载后挂到 `app.stage`，走 WebGL；要求暴露 `window.PIXI` 供其 `Ticker` 自动驱动模型更新；按需导入时需手动 `Live2DModel.registerTicker(Ticker)`、`Application.registerPlugin(TickerPlugin)`、注册 InteractionManager（README "Basic usage"/"Package importing"）。Electron 场景 = 透明 BrowserWindow + WebGL canvas，与桌宠穿透/置顶窗口方案天然兼容。
+  2. **Cubism Core 是外部依赖，不在 npm 里**：Cubism 4 需 `live2dcubismcore.min.js`，只能从 [Cubism SDK 官方下载页](https://www.live2d.com/download/cubism-sdk/download-web/)解包（下载即接受 Live2D 专有 EULA），官方直链"极不可靠、勿用于生产"（README 原话）；Cubism 2.1 的 `live2d.min.js` 官方自 2019-09-04 起停止分发，只剩社区镜像（[dylanNew/live2d](https://github.com/dylanNew/live2d/tree/master/webgl/Live2D/lib)）。打包时按需选 bundle：`cubism4.js`+core（只支持 3/4 模型）或 `index.js`+两个运行时（全支持）。
+  3. **高层 API**：Pixi 式变换（x/y/rotation/skew/scale/anchor）；自动交互——聚焦（模型视线跟随指针）与命中检测（`model.on('hit', areas => model.motion('tap_body'))`）；比官方框架更强的 motion 预约排队逻辑；支持 RenderTexture 与 Filter；从 zip/上传文件加载模型（实验性）。完整方法面见 [API 文档](https://guansss.github.io/pixi-live2d-display/api/index.html)。
+  4. **许可证双层结构（商业化的真正闸门）**：插件代码 MIT 只覆盖重写的胶水层；**Cubism Core 按 [Live2D Proprietary Software License](https://www.live2d.com/eula/live2d-proprietary-software-license-agreement_en.html) 授权**，结构/源码属 Live2D 机密，未明确授予的权利全部保留。发布用 SDK 产出的内容需 [SDK Release License（出版许可协议）](https://www.live2d.com/en/sdk/license/)：个人与小规模事业者（"Business" = 最近财年营收 > 1,000 万日元）**豁免签约与付费——但 Expandable Application 除外**。
+  5. **Expandable Application 条款直击桌宠**：官网原文"若要把 Cubism SDK 集成进**以 Live2D 作为 AI/聊天机器人界面**的内容，先用流程图判定是否属 Expandable Application"；定义是"利用 SDK 产品的服务/内容中**具有显著可扩展性**者"，此类内容**发布前必须过 Live2D 审查并签特殊出版许可协议——个人/免费/小规模也不例外**。官网还点名 VTuber 直播追踪软件即属此类（其 [CubismWebSamples LICENSE.md](https://github.com/Live2D/CubismWebSamples/blob/develop/LICENSE.md) 同样写明"所有 business 用户必须取得 Release License"）。可扩展桌面宠（允许换模型/装插件）与此定义高度重合，需逐一对照官方流程图自查。
+  6. **原生应用付费档位**（非 Expandable 时的流程图分支）：Native 分布式应用分 Non-profit Content Plan（非营利免费）/ One-time Purchase Content Plan（一次性买断，非主机类）/ Running Royalty Content Plan（流水抽成，游戏类）；B2B2X 或无法归类的需单独联系官方。
+- 可借鉴：
+  - 【照抄】Electron 集成形态：透明 BrowserWindow → `cubism4` 子包 + 本地打包 `live2dcubismcore.min.js`（走 SDK 下载页拿文件，不用 CDN 直链）→ `Live2DModel.from()` 加载 `model3.json`；主题包格式可直接用它实验性的 zip 加载通道。
+  - 【照抄】`hit` 事件 → `motion()` 触发的交互模型：桌宠"点头/摸肚子"交互一行代码可得，凌凌的行为系统只需把 LLM 决策映射到 `model.motion()/expression()` 调用即可。
+  - 【评估·决策关键】**模型导入开放度 = 许可证风险开关**：若凌凌只内置官方授权/自制固定模型，走 Non-profit/One-time 流程图自查即可；一旦允许用户或社区导入任意第三方模型（"显著可扩展性"），就必须按 Expandable Application 向 Live2D Inc. 申请审查+特殊出版许可（免费产品也要）。这条直接决定产品架构：**模型商店/自定义导入功能上线前先过这一关**。
+  - 【评估】口型同步需求：主线无 lipsync，社区 fork [pixi-live2d-display-lipsyncpatch](https://www.npmjs.com/package/pixi-live2d-display-lipsyncpatch)（npm 最新 0.5.0-ls-8，2025-06-02 发布）在 0.5.0-beta 基础上加口型同步——凌凌接 TTS 说话时可评估换 fork。
+  - 【改造】维护停滞的应对：主线锁 PixiJS 6 + npm 0.4.0（2022 年版）；若要上 pixi 7/8 需走 0.5.0-beta 或 fork 自维护。建议在 package.json 里 pin 死版本并把"升级 pixi"列为高风险变更。
+- 要避开：
+  - 别把 MIT 当全链路自由：**Cubism Core 不可自行再分发**（不得塞进公开 npm 包/CDN 供人下载），只随自家应用分发给最终用户使用；许可文本需随构建产物附带。
+  - 别用官方 cubismcore 直链上生产（上游自己警告不可靠），也别依赖 Cubism 2.1 支持（运行时已停发 7 年，供应链无保障）。
+  - 别在许可判定前公开宣传"支持任意 Live2D 模型"或上线模型导入市场——Expandable Application 审查是发布前置条件，不是事后补办。
+  - 别期望官方框架级更新：2 年无 commit，遇 Cubism 5 时代新特性（如 Cubism 5.4 新导出物）可能要自己动手。
+- 来源链接：[GitHub 仓库](https://github.com/guansss/pixi-live2d-display) · [README（Cubism Core / 安装 / 用法各节）](https://github.com/guansss/pixi-live2d-display#readme) · [官方文档](https://guansss.github.io/pixi-live2d-display) · [Live2D Proprietary Software License Agreement（v2.1, 2025-02-03）](https://www.live2d.com/eula/live2d-proprietary-software-license-agreement_en.html) · [SDK Release License 页（Expandable Application / 收费流程图 / AI 聊天机器人条款）](https://www.live2d.com/en/sdk/license/) · [Live2D 中文 SDK 许可说明](https://www.live2d.com/zh-CHS/sdk/license/) · [CubismWebSamples LICENSE.md（Business=营收>1000 万日元定义）](https://github.com/Live2D/CubismWebSamples/blob/develop/LICENSE.md) · [Cubism SDK for Web 下载页](https://www.live2d.com/download/cubism-sdk/download-web/) · 星标/活跃度：GitHub API `repos/guansss/pixi-live2d-display`（2026-11-23：1,518★ / MIT / pushed 2024-08-20）；npm registry（2026-11-23：0.4.0 发布于 2022-09-04）

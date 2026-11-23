@@ -1,0 +1,21 @@
+# Live2DPet（x380kkm）
+
+- 仓库：https://github.com/x380kkm/Live2DPet · 星标：**93**（2026-11-22，GitHub API 实测；主表归入中度层偏高，实际是小众项目——但**关键帧视觉记忆与本项目 capture_screen/ledger 直接对标，研究价值远超星标**） · 语言/栈：Electron + JavaScript，Live2D Cubism SDK + PixiJS + pixi-live2d-display，VOICEVOX Core 走 koffi FFI，Claude Code 辅助开发 · 许可：MIT · 活跃度：中（最近推送 2026-06-22；社区增强版 dwgx/Live2DPet-Enhanced 存在）
+- 一句话定位：单文件 exe 的"看得见你"桌宠——定时截屏+窗口感知喂给 VLM，用关键帧视觉记忆让 AI 记得你最近在干嘛。
+- 架构/功能要点（README 架构图全读）：
+  - **感知管线**：定时截屏 + 活动窗口检测 → VLM（推荐 Grok/GPT-o3/Gemini）分析屏幕内容 → AI 主动发起气泡对话；截屏**不落盘**（隐私声明明确"发送至你配置的 API，不保存本地磁盘"）。
+  - **关键帧视觉记忆（对标核心）**：`enhancement-orchestrator` 调度 → `vlm-extractor` 做截图采集/**Mipmap 多分辨率缩放**/关键帧挑选（VLM 从连续截屏流中选代表性帧）→ AI 可"回顾近期活动"。⚠️ 注意：配套的 context-pool（短期+长期池 Jaccard RAG）、knowledge-store、memory-tracker 等**记忆子系统在 v2.0 已标记"弃置"，仅保留代码骨架**——纯视觉记忆路线的长期成本已被作者用脚投票。
+  - 情绪系统：AI 驱动表情/动作选择，情绪值累积触发（`emotion-system.js`）。
+  - 音频状态机：TTS → 默认音声 → 静音三模式自动降级（`audio-state-machine.js`）；message-session 协调文字+表情+音频同步播放。
+  - VOICEVOX 本地 TTS：Core + ONNX Runtime + Open JTalk 全组件应用内一键安装（失败可手动放置），中→日 LLM 翻译 + LRU 缓存，DirectML GPU 加速。
+  - 模型热导入：扫描 `.model.json`/`.model3.json` → 自动映射眼球/头部追踪参数 → 自动扫描表情/动作组 → 复制到用户数据目录；**图片文件夹模型**：PNG 按待机/说话/表情三用途标记，AI 情绪自动切图。
+  - 主进程模块化：app-context/config-manager(AES-256-GCM 密钥加密)/window-manager/character-manager/model-import 分文件；三个 renderer（设置窗/宠物窗/气泡窗）。
+- UI/交互模式：
+  - 互动事件（点击/触摸/拖拽/划过/缩放）**全部注入 AI 上下文**——不是本地播放动画，而是"用户刚刚摸了你"进 prompt；这是它和传统桌宠最大的分野。
+  - 设置面板标签页式：API/模型/TTS/角色四页；角色卡 JSON 模板（`{{petName}}`/`{{userIdentity}}` 变量），内置"毒舌后辈"默认卡（中英日三语）。
+  - 气泡对话独立窗口（pet-chat-bubble.html）；拖拽移动；启动时透明窗口出现在右下角。
+- 对凌凌的启示（与凌凌 capture_screen/ledger 设计逐点对比）：
+  - **照抄**：①**Mipmap 多分辨率存关键帧**——我们 ledger 存截屏时应同时存缩略图层级，检索时先看缩略图再决定是否调大图，省 VLM token；②互动事件注入 AI 上下文（凌凌的 ledger 目前只记屏幕，用户互动是免费的"高价值事件"，必须记）；③音频三模式降级状态机；④"截屏不落盘"的隐私开关做成用户可选。
+  - **改造**：它的关键帧挑选靠 VLM 逐帧判断（贵），凌凌可用"帧差分+OCR 文本变化率"本地初筛、只把变化大的帧给 VLM——成本降一个数量级；它弃置的记忆池（Jaccard RAG）证明**纯视觉记忆撑不起长期陪伴**，凌凌的 ledger 应以文本/事件为主、截屏为证据附件。
+  - **避开**：截图直接发第三方 API 的默认行为（隐私事故定时炸弹）；93 星项目的单维护者风险——它的弃置子系统就是过劳弃坑的前兆。
+- 来源链接：[GitHub README](https://github.com/x380kkm/Live2DPet)（存档 `_raw/live2dpet.md`）、[GitHub API](https://api.github.com/repos/x380kkm/Live2DPet)、[增强版 Live2DPet-Enhanced](https://github.com/dwgx/Live2DPet-Enhanced)、[pixi-live2d-display](https://github.com/guansss/pixi-live2d-display)

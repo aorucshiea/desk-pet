@@ -1,0 +1,21 @@
+# Project AIRI（アイリ）
+
+- 仓库：https://github.com/moeru-ai/airi · 星标：**51,649**（2026-11-22，GitHub API 实测；主表所记 2.2 万已过时） · 语言/栈：TypeScript + Vue 3 + Electron + Vite monorepo，渲染层 WebGPU/Three.js/pixi-live2d-display，桌面推理走 HuggingFace candle（原生 CUDA/Metal） · 许可：MIT · 活跃度：极高（最近推送 2026-11-22，v0.15.4，日增数百星，Trendshift 周榜 #1）
+- 一句话定位：开源 Neuro-sama 复刻——"AI 虚拟生命的灵魂容器"，能打游戏（Minecraft/Factorio）、看你的屏幕、多端陪伴（浏览器/桌面/手机）的 AI VTuber 操作系统。
+- 架构/功能要点：
+  - Monorepo 三端同核：`stage-web`（浏览器）、`stage-tamagotchi`（Electron 桌宠）、`stage-pocket`（Capacitor 手机）共享 `stage-ui`、`core-agent`、`core-character`、`pipelines-audio` 等约 60 个 packages。
+  - 记忆：**DuckDB-WASM 纯浏览器内嵌数据库** + 自研 `drizzle-duckdb-wasm` ORM 驱动 + `memory-pgvector`（服务端向量检索）；下一代"Memory Alaya"在研。即记忆系统是"本地 SQLite/向量库 + 可选服务端 pgvector"的混合。
+  - 插件化：`plugin-protocol` / `plugin-sdk` / `plugin-sdk-tamagotchi` / `extension-protocol` 全套协议层；周边子项目（RAG、Live2D 工具、图标）拆到 @proj-airi 组织。
+  - LLM 接入：自研 xsai（类 Vercel AI SDK 的轻量版），30+ 供应商预设。
+  - 游戏联动：Minecraft bot、airi-factorio（RCON REST 包装 + 纯视觉方案）、Dome Keeper 数据采集训练管线。
+  - 感知链路：浏览器端 STT、说话检测（VAD）、客户端 TTS（ElevenLabs/Azure/Kokoro 本地）。
+- UI/交互模式：
+  - **舞台（Stage）隐喻**：角色不是"窗口里的图"，而是占据一个可换布景的舞台，UI 受 Cookard/UNBEATABLE 等独立游戏美术影响（波普、贴纸感）。
+  - VRM/Live2D 双渲染：自动眨眼、自动视线跟随、待机眼球微动三件套作为"活性"基线；口型同步独立成 `model-driver-lipsync` 包。
+  - 桌宠模式即"Tamagotchi"命名，刻意往电子宠物方向收敛而非聊天窗口；手机端叫 Pocket（电子宠物机隐喻）。
+  - 无养成数值系统——它是"赛博生命"路线：成长体现在能力解锁（会打游戏/会看屏幕）而非数值面板。
+- 对凌凌的启示：
+  - **照抄**：DuckDB-WASM 跑在本地进程内做记忆库（零部署、单文件、可 SQL 查询）——比我们现在的 ledger 方案更结构化，且 MIT 无传染风险；`plugin-sdk` 式的协议分层；多端共享一个 stage-ui 的 monorepo 布局。
+  - **改造**：它的"能力解锁=成长"思路可以翻译成凌凌的等级系统（不用好感度数值，用"会做的事"变多来表达成长）；xsai 式轻量 provider 层替代完整 SDK。
+  - **避开**：60+ packages 的 monorepo 复杂度（26 贡献者全职投入的产物，小团队照搬会 drown）；WebGPU 全家桶在低端 Windows 机器上的兼容性坑。
+- 来源链接：[GitHub README](https://github.com/moeru-ai/airi)（本地存档 `docs/competitors/_raw/airi.md`）、[GitHub API 元数据](https://api.github.com/repos/moeru-ai/airi)、[packages 目录](https://github.com/moeru-ai/airi/tree/main/packages)、[腾讯云开发者社区介绍](https://cloud.tencent.cn/developer/article/2639486)

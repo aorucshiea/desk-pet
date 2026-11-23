@@ -1,0 +1,22 @@
+# VPet-Simulator（虚拟桌宠模拟器）
+
+- 仓库：https://github.com/LorisYounger/VPet · 星标：**7,273**（2026-11-22，GitHub API 实测；30 天 +315） · 语言/栈：C# / .NET WPF，核心库 `VPet-Simulator.Core` 发 NuGet 可内嵌任意 WPF 应用；Steam 免费发行 + 创意工坊 · 许可：**Apache-2.0**（注意：自带动画素材有单独版权声明，禁止商售） · 活跃度：高（最近推送 2026-11-22，GitGenius 记录 2026-11-04 仍在推进，Issue 中位响应 25.9h）
+- 一句话定位：把桌宠做成"真正的游戏"——投喂/打工/生病/好感度完整养成循环 + 200+ 动画 + Steam 创意工坊 MOD 生态，源自《虚拟主播模拟器》内置桌宠的独立开源版。
+- 架构/功能要点：
+  - 三层结构：`Core`（引擎，NuGet 分发）→ `Windows`（桌面端壳：CoreMOD/MWController/winBetterBuy 商店/winSetting/主窗体）→ `Tool`（MOD 制作器，图片帧生成）。
+  - 养成数值系统（源码 `GameSave.cs` 实测，远比宣传页复杂）：
+    - **七维数值**：金钱、经验、体力 Strength、饱腹度 StrengthFood、口渴度 StrengthDrink、心情 Feeling、隐藏的 健康 Health 与 好感度 Likability。
+    - **"待补充池"机制（Store* 字段）**：吃东西只结算一半，另一半进 Store 池按 1/10 每 tick 缓慢释放——制造"吃撑了慢慢消化"的持续反馈，防止数值瞬间满格。`CleanChange()` 里所有 Change 变量每轮减半，形成平滑动画曲线。
+    - **数值越界惩罚联动**：饱腹度/口渴度 ≤0 直接扣健康；心情 ≤0 扣健康和好感度各一半；好感度溢出上限（90+等级×10）转为加健康——所有溢出都有去处，无浪费。
+    - **状态机 CalMode()**：生病阈值 = 60 −(心情≥80 减 12)−(好感度≥80 减 12/≥40 减 6)，即心情和好感度会"提高生病防线"；开心判定 = 心情比例 ≥0.9−(好感度加成最高 0.2)。五态：Happy/Nomal/PoorCondition/Ill + 等级由 Exp 平方根推导（Level=√Exp/10+1）。
+  - 动画组织（README + 微信测评交叉验证）：32 种动作 × 4 状态 × 3 类型（"理论上 384 种，实际偏少"≈200+）；`FoodAnimation` 支持**前/中/后三层夹心渲染**（宠物在食物后面→食物→宠物在食物前面）；`PNGAnimation`/`Picture` 两个动画组件；`GraphInfo` 统一描述动画元数据。
+  - MOD 生态：创意工坊支持动画/物品/工作/说话文本/主题五类 JSON 素材 MOD + **C# 代码插件**（可挂 Live2D/Spine 引擎、闹钟、AI 行为，示例仓库 VPet.Plugin.Demo）；官方 ModMaker 可视化制作器。
+- UI/交互模式：
+  - 互动动词表：摸头（眯眼蹭手）、提起（鼠标拖拽在空中扑腾）、投喂、喝水、打工（WorkTimer 计时赚金钱+经验）、睡觉、玩耍、爬墙（沿屏幕边缘行走）。
+  - 点击宠物弹 **ToolBar 径向工具栏**，说话时 MessageBar 气泡；PetHelper 常驻快速切换小标。
+  - 主题系统（basestyle/Theme）+ MOD 皮肤一键换；数值面板走 Steam 游戏化表达而非仪表盘。
+- 对凌凌的启示：
+  - **照抄**：①"Store 池"待补充机制（我们喂食/充电后数值应该缓慢恢复而非跳变）；②溢出转健康/好感度的数值守恒设计；③"心情/好感度提高生病阈值"的耦合——让照顾行为有长期收益；④三层夹心动画（凌凌用 Live2D 可简化为前后 mask 两层）。
+  - **改造**：它的 CalMode 五态机可直接映射到凌凌的情绪引擎输入；工作/打工系统改成"陪用户工作"（番茄钟挂机给金币）避免价值观问题；C# 插件生态 → 我们的 dsh 插件机制。
+  - **避开**：动画素材版权坑（它自己都要发版权声明，我们用 Live2D 官方示例模型规避）；WPF 单平台绑定。
+- 来源链接：[GitHub README](https://github.com/LorisYounger/VPet)（本地存档 `_raw/vpet.md`）、[GameSave.cs 源码](https://github.com/LorisYounger/VPet/blob/main/VPet-Simulator.Core/Handle/GameSave.cs)（存档 `_raw/vpet-gamesave.cs`）、[GitHub API](https://api.github.com/repos/LorisYounger/VPet)、[微信开源测评](http://mp.weixin.qq.com/s?__biz=MzY5ODI2NDU5NA==&mid=2247483967&idx=1&sn=b71989fd43954a579bc167)（384 组合/夹心动画数据）、[GitGenius 活跃度](https://www.gitgenius.co/repos/LorisYounger/VPet)

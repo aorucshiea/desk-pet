@@ -1,0 +1,21 @@
+# DyberPet（呆啵宠物）
+
+- 仓库：https://github.com/ChaozhongLiu/DyberPet · 星标：**1,030**（2026-11-22，GitHub API 实测） · 语言/栈：Python 3.9+ / PySide6 + PyQt-Fluent-Widgets（Windows11 风格 UI），apscheduler 计划任务，pynput 鼠标监听 · 许可：**GPL-3.0**（主表误记 MIT——代码级借鉴需整项目 GPL，仅可参考设计） · 活跃度：高（最近推送 2026-10-16，v0.11.5 打包 Windows exe；开源仓库仅到 v0.6.7，之后闭源打包发布）
+- 一句话定位：PySide6 的"完整桌宠 App"框架——养成数值+商店+背包+番茄钟+昼夜作息+对话气泡+MOD 生态，AI 对话是加分项而非前提。
+- 架构/功能要点（深度参考其官方素材开发文档，971 行全读）：
+  - **双模块动画架构**：动画模块（低优先级随机播放，永不阻塞 UI）+ 交互模块（20ms 刷新即时响应用户）分离。
+  - **养成数值**：饱食度 HP（2 分钟降 1 点）+ 好感度 FV（饿昏时下降）+ 啵币经济。**好感度 200 级封顶、每级恒定 120 点**（v0.6.4 改的，原来的 7 级太容易毕业）；等级徽章四档：星(1)/月(4)/太阳(16)/皇冠(64)。
+  - **商店/背包**：物品四类型 consumable/dialect/collection/subpet（迷你宠物本质是物品）；`fv_lock` 好感度门槛解锁、`fv_reward` 升级奖励、`drop_rate` 拍拍掉落权重、默认价 `50×(fv_lock+1)`；**Buff 系统 5 种**：hp/fv/coin 定时增益 + HP_stop/FV_stop 定时停降。
+  - **昼夜作息系统（day_night）**：白天播常规随机池，夜晚只播睡眠循环+低概率翻身（`night_random_prob` 默认 0.1），入睡/起床/被吵醒三段过渡动画；夜间动画不受饱食度限制；用户全局设置昼夜时刻（默认 08:00/23:00）。
+  - **AI 接口**：v0.11 加入大模型助手（陪伴聊天/待办管理），LLM 模块持续开发中"相关能力暂未完全开源"；社区已有 KimiChat/BertVITS2 接入案例（Genshin 语音分支仓库 310 星）。
+  - 附加：迷你宠物排队跟随主宠（自动补位 anchor_x）、可穿戴 Equip 组件（翅膀/披风，跟随锚点）、对话分支物品（JSON relationship 图，Galgame 式选项）。
+- UI/交互模式（控件级）：
+  - **对话气泡 9 种触发器**：好感升级/好感下降/饿（<80）/饿昏（=0）/喂食完成/随机讨食（"USERTAG 我想要 ITEMNAME"带用户昵称系统）/专注时拍拍（"你现在应该专注"）/频繁点击（1 秒≥7 次）/随机闲聊（40% 概率）——每种气泡可自定义图标、文字、开始/结束语音。
+  - **通知 toaster 合并**：数值增减通知与旧通知合并防刷屏；语音优先级排序（喂食语音最高，可打断随机语音）。
+  - **动画概率矩阵**：每个动作标 `act_type [饱食度分级, 解锁好感等级]`，4 档饱食度（>80 活力/>50 正常/>0 饥饿/=0 饿昏）对应播放概率 a、a/4、a/16、0 的矩阵——饱食度高时宠物活泼，饿昏时只会"睡觉"。
+  - 拍拍动画按饱食度分档（`patpat: {0:..,1:..,2:..,3:..}`）；浮动心心出现在点击位置；拖拽抛物线掉落+地面反弹；客制化鼠标光标（进入/拍拍/拖拽三态）。
+- 对凌凌的启示：
+  - **照抄**：①动画概率矩阵（把"状态→动画"从硬编码改成 JSON 配置+概率权重，凌凌可直接采用同款 4 档）；②对话气泡 9 触发器清单（特别是"频繁点击"和"专注时拍拍"这种反直觉细节，让宠物有脾气）；③通知合并+语音优先级（防止数值通知刷屏是桌宠 App 头号体验杀手）；④好感度恒定 120/级 + 徽章分档（比 VPet 的平方根更可理解）。
+  - **改造**：昼夜作息做成凌凌的"作息感知"（结合 dsh 已有的 scheduled task）；GPL 代码不能抄但 JSON 模组格式设计可以平行发明。
+  - **避开**：闭源新版路线（开源到 v0.6.7 然后闭源打包，社区信任损耗）；QImage→QPixmap 这类 Qt 特定优化不适用于 Electron。
+- 来源链接：[GitHub README](https://github.com/ChaozhongLiu/DyberPet)（存档 `_raw/dyberpet.md`）、[素材开发文档 art_dev.md](https://github.com/ChaozhongLiu/DyberPet/blob/main/docs/art_dev.md)（存档 `_raw/dyberpet-artdev.md`）、[GitHub API](https://api.github.com/repos/ChaozhongLiu/DyberPet)、[Genshin 语音分支](https://github.com/ChaozhongLiu/DyberPet_GenshinImpact)
