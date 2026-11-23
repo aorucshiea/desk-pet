@@ -497,6 +497,13 @@ CORTEX_DECISION_TIMEOUT_USER = _cortex_timeout_env(
 # Alert once per failure streak so the brain feed explains the quiet.
 _D_INTUITION_ALERT = {"streak": 0}
 
+# Reflex time-sense latch: only the small model's own previous `time_relevant`
+# may unlock the clock for the NEXT tick. The grant is one round late by
+# design — the model asks this tick, the system answers the next one — so the
+# flag must survive the round: it cannot live in the per-round `_reflex_decision`
+# local (that was reset to None before the check and the loop never closed).
+_REFLEX_TIME_STATE = {"wanted": False, "asked_at": 0.0}
+
 THINK_EVENT_MIN_CHARS = 600
 THINK_EVENT_MIN_SECS = 5.0
 
@@ -639,6 +646,10 @@ _pending_vitals_round: dict = {"organize_kind": None, "overflow": False}
 
 # B-17 双睡眠统一：上次推送给壳的 vitals 睡眠态（None=未知，True=睡着，False=清醒）
 _last_vitals_sleep: Optional[bool] = None
+
+# Fire-and-forget boot tasks (reflex 预热等) 需要强引用：裸 create_task 返回的
+# Task 只被弱引用持有，事件循环空转时可能被 GC，协程就悄无声息地不再执行。
+_BOOT_TASKS: "set" = set()
 
 # 记忆整理轮（点 7）：audit 只保留核心记忆工具；recap 一个工具都不给。
 _ORGANIZE_AUDIT_TOOLS = {"memory", "recall", "memory_search"}
@@ -1601,6 +1612,33 @@ def build_app(
         import asyncio as _aio
         _aio.get_event_loop().create_task(_curator_startup_check())
 
+        # ── 快直觉预热（System 0）─────────────────────────────────────
+        # LM Studio 的模型是惰性加载的：重启后第一次 judge() 会撞上冷加载
+        # （CPU 上 1.7B + 和主脑模型抢同一个服务），必然超过单拍超时，于是
+        # 每个"第一个生命拍"都回落 quiet，小模型等于没上过岗。这里在事件
+        # 循环里打一发最便宜的请求把它顶进内存；失败只是日志、绝不阻塞启动。
+        # 必须在 lifespan 内调度（build_app 阶段没有运行中的 loop）。
+        _rx_boot_cfg = _reflex_config_ref.get("cfg")
+        if _rx_boot_cfg is not None and bool(_rx_boot_cfg.enabled):
+            async def _reflex_prewarm():
+                try:
+                    result = await _reflex_module.prewarm(_rx_boot_cfg)
+                    if result.get("ok"):
+                        log.info(
+                            "reflex prewarm ok: model=%s loaded in %.1fs",
+                            _rx_boot_cfg.model,
+                            result.get("latency_ms", 0) / 1000.0,
+                        )
+                    else:
+                        log.warning(
+                            "reflex prewarm failed: model=%s %s",
+                            _rx_boot_cfg.model, result.get("failure") or "unknown",
+                        )
+                except Exception as exc:  # prewarm must never break boot
+                    log.warning("reflex prewarm crashed: %s", exc)
+            # Keep a strong reference: a bare create_task can be GC'd.
+            _BOOT_TASKS.add(_aio.get_event_loop().create_task(_reflex_prewarm()))
+
         # ── B-15: self-check heartbeat (自主稳态——检测"我病了"并记下来) │
         # Passive survival exists (web-panel lifeboat, provider fallback,
         # OmniParser restart cap). What's missing is ACTIVE self-awareness:
@@ -1608,6 +1646,12 @@ def build_app(
         # a state transition write an event memory — the pet remembers being
         # sick, and wakes up knowing it was sick ("生病了"叙事进记忆流).
         async def _health_loop():
+            # The sleep-state push latch is module-level: a name assigned
+            # anywhere in this function is local for the WHOLE function, so
+            # without `global` the first read at the vitals tick raises
+            # UnboundLocalError ("vitals charge tick failed" every 5 min)
+            # and the body never recharges while awake.
+            global _last_vitals_sleep
             HEALTH_INTERVAL = 300          # seconds between probes
             SICK_THRESHOLD = 3             # consecutive failures → degraded
             state = {"llama_fail": 0, "bridge_fail": 0, "degraded": False,
@@ -1903,6 +1947,9 @@ def build_app(
             "reflex config: url=%s model=%s enabled=%s (providers=%s)",
             _rc.url, _rc.model, _rc.enabled, _providers_path,
         )
+        # 预热不在这里调度：build_app 执行时还没有运行中的事件循环，在这里
+        # create_task 会挂到一个永远不会跑的 loop 上。真正的调度在 lifespan
+        # 里（见 _reflex_prewarm 那段）。
     except Exception as exc:
         set_reflex_config(None)
         log.warning("reflex config load failed (continuing without): %s", exc)
@@ -6232,6 +6279,17 @@ async def _stream_chat_provider(
     _d_budget = None
     if not req.silent and _cortex_enabled():
         _cortex_store = _continuity_store
+    # ── 快直觉 reflex 门（System 0）是否武装 ─────────────────────────
+    # 提前到 D 核心之前算好：D 的 Laya 回落告警要据此静音——reflex 在
+    # 场时它才是 D 的唯一决策者，"生命轮只能保持安静"的告警就是假的。
+    _rx_cfg = get_reflex_config()
+    _rx_gate_armed = (
+        _cortex_store is not None
+        and _is_proactive
+        and not _pending_organize_kind
+        and _rx_cfg is not None
+        and bool(_rx_cfg.enabled)
+    )
     # ── 睡梦中的用户说话（吵醒阶梯；vitals 点 5）─────────────────────
     # THE only user-wake entry. Each call = one 吵醒 = 1.0 HP damage and a
     # sleep-plan multiplier inside the module; the reply goes out normally
@@ -6434,7 +6492,9 @@ async def _stream_chat_provider(
                 _D_INTUITION_ALERT["streak"] = 0
             elif _decision.get("source") == "prior":
                 _D_INTUITION_ALERT["streak"] += 1
-                if _D_INTUITION_ALERT["streak"] == 3:
+                # reflex 武装时 D 的先验只是参考，安静轮由小模型裁决——
+                # 这时报"生命轮只能保持安静"既假又刷屏，静默计数即可。
+                if _D_INTUITION_ALERT["streak"] == 3 and not _rx_gate_armed:
                     _reason = str(_decision.get("reason") or "-")
                     log.warning(
                         "D intuition unavailable for 3 life rounds: %s", _reason
@@ -6477,8 +6537,19 @@ async def _stream_chat_provider(
         except Exception:
             pass
 
-        # D-only context for the author of the rolling summary. The summary
-        # is intuition state, NOT memory, and never shown to the user.
+    # ── D 决策最终发布（必须在 reflex 覆盖之后）───────────────────────
+    # 面板和主脑 prompt 必须看到真正裁决这一轮的那份决策：reflex 在场
+    # 时它就是唯一决策者（D 的先验采样只是参考）。所以 summary/d_decision
+    # 事件与 req.system 注入都挪到 reflex 门之后；reflex-quiet 路径在
+    # return 前自己调用一次。
+    # 面板的"延迟"必须报真正裁决者的耗时：reflex 在场时报小模型的整拍
+    # 耗时，而不是 D 那条（已经没用的）Laya 尝试的 2 秒。
+    _d_latency_ms: Optional[float] = None
+
+    def _publish_d_decision() -> str:
+        nonlocal _d_summary, _d_decision_text
+        if _cortex_store is None:
+            return ""
         try:
             _d_summary = str(_cortex_store.summary or "（还没有）")
             _d_decision_text = _cortex.decision_to_prompt(_decision)
@@ -6499,20 +6570,23 @@ async def _stream_chat_provider(
                 max_tokens=_decision.get("max_tokens"),
                 source=_decision.get("source"),
                 confidence=_decision.get("confidence"),
-                latency_ms=_cortex_latency_ms,
+                latency_ms=(
+                    _d_latency_ms if _d_latency_ms is not None
+                    else _cortex_latency_ms
+                ),
                 summary_chars=len(_d_summary),
                 decision_id=_decision.get("decision_id"),
             )
-            _d_block = (
+            return (
                 "\n\n【你的底层直觉状态（只用于行动，不要在回复里复述）】\n"
                 "上一轮生命总结（主观想法，可能错；不是摄像头或执行事实；用它更新本轮 DSTATE）：\n"
                 f"{_d_summary}\n"
                 f"{_d_decision_text}\n"
                 "用户直接说话时必须回应；默认动作只是默认，你可以改。"
             )
-            req.system = (req.system or "") + _d_block
         except Exception as exc:
             _note_failure("cortex_prompt_injection", exc)
+            return ""
 
     # ── 快直觉 reflex 门（System 0）：主动轮的升级判定 ────────────────
     # The gate covers EVERY proactive round (economics: D's non-quiet
@@ -6531,15 +6605,9 @@ async def _stream_chat_provider(
     # Reflex layer absent or disabled → nothing here runs: a D-quiet round
     # falls through to the old early return right after this block, a
     # D-non-quiet round proceeds to the main brain as today.
+    # (`_rx_cfg` / `_rx_gate_armed` are computed before the D core so the
+    # Laya-fallback alert can be silenced while the reflex answers.)
     _reflex_decision: Optional[dict] = None
-    _rx_cfg = get_reflex_config()
-    _rx_gate_armed = (
-        _cortex_store is not None
-        and _is_proactive
-        and not _pending_organize_kind
-        and _rx_cfg is not None
-        and bool(_rx_cfg.enabled)
-    )
     if _rx_gate_armed:
         # Reflex state snapshot — only what is already in hand this round
         # (D summary / idle / mood index / ledger fast entries). new_events
@@ -6573,20 +6641,36 @@ async def _stream_chat_provider(
                 ][-3:]
         except Exception:
             _rx_thoughts = []
+        # 真实上下文（不再硬编码 False/0）：用户最近是否在场、本轮之前有
+        # 多少新事件——否则用户刚说完"你叫我别睡"，下一拍小模型看到的
+        # 还是"用户不在、零新事件"→ 校准指导告诉它 quiet → 刚聊完就装不认识。
+        _now_ts = time.time()
+        _last_user_at = float(_DENSITY_STATE.get("last_user_turn_at") or 0.0)
+        _user_ago = max(0.0, _now_ts - _last_user_at) if _last_user_at > 0 else 9999.0
+        _user_present = _user_ago <= 120.0  # 2 分钟内说过话 = 在场
+        _last_round_at = float(_DENSITY_STATE.get("last_round_at") or 0.0)
+        _new_events = sum(
+            1 for ts, _ in _DENSITY_EVENTS
+            if (_last_round_at <= 0.0 or ts > _last_round_at)
+            and 0.0 <= _now_ts - ts <= _DENSITY_EVENT_WINDOW_S
+        )
         _reflex_state = {
             "summary": _rx_summary,
             "tempo_mode": _d_tempo_mode or "slow",
-            "new_events": 0,
-            "user_present": False,
+            "new_events": _new_events,
+            "user_present": _user_present,
             "idle_s": _d_idle,
             "mood": _mood_label_for_reflex(_rx_mood_idx),
             "recent_thoughts": _rx_thoughts,
             "d_action": str(_decision.get("action") or "quiet"),
+            "user_ago_s": round(_user_ago, 1) if _last_user_at > 0 else None,
         }
         # 授时闭环：只有上一轮小模型自己标了 time_relevant（它说"我需要
-        # 知道时间"），这一轮才附上当前时间和距上次主脑轮的时长。
-        # 不主动报时——时间感是模型自己的选择，不是系统塞给它的。
-        if isinstance(_reflex_decision, dict) and _reflex_decision.get("time_relevant"):
+        # 知道时间"），这一轮才附上当前时间和距上次主脑轮的时长。不主动
+        # 报时——时间感是模型自己的选择，不是系统塞给它的。闩锁必须跨轮
+        # 持久化：本轮 `_reflex_decision` 还没生成（下面才 judge），所以
+        # 这里读的是 _REFLEX_TIME_STATE（上一拍写进去的）。
+        if bool(_REFLEX_TIME_STATE.get("wanted")):
             _reflex_state["current_time"] = datetime.now().strftime("%H:%M")
             _last_main_at = float(_DENSITY_STATE.get("last_round_at") or 0.0)
             if _last_main_at > 0:
@@ -6598,13 +6682,15 @@ async def _stream_chat_provider(
             _reflex_state, _rx_cfg
         )
         _reflex_latency_s = (time.perf_counter() - _rx_started)
+        _d_latency_ms = _reflex_latency_s * 1000.0
         log.info(
-            "reflex tick action=%s think=%s next=%ss lat=%.1fs src=%s",
+            "reflex tick action=%s think=%s next=%ss lat=%.1fs src=%s fail=%s",
             _reflex_decision.get("action"),
             bool(_reflex_decision.get("think")),
             _reflex_decision.get("next_check_s"),
             _reflex_latency_s,
             _reflex_decision.get("source"),
+            _reflex_decision.get("failure") or "-",
         )
         try:
             telemetry.inc("reflex.ticks")
@@ -6612,6 +6698,77 @@ async def _stream_chat_provider(
                 telemetry.inc("reflex.fallback")
         except Exception:
             pass
+        # 小模型的时间意志落盘：它这一拍说"我需要时间"，下一拍系统才授时。
+        # 不能放局部变量——下一拍 `_reflex_decision` 会被重置成 None。
+        _REFLEX_TIME_STATE["wanted"] = bool(_reflex_decision.get("time_relevant"))
+        _REFLEX_TIME_STATE["asked_at"] = (
+            time.time() if _REFLEX_TIME_STATE["wanted"] else 0.0
+        )
+        # ── reflex 决策覆盖 D 先验采样（安静轮 + 升级轮都要）─────────────
+        # 用户裁定：D 的思考强度/持续反应/默认动作由直觉小模型决定，D 的
+        # 先验采样只作参考。覆盖必须发生在发布/注入/req 赋值之前——旧代码
+        # 把覆盖放在升级分支末尾，req 在更早的 6389 行就已按 D 先验写好，
+        # 所以小模型的 think/reaction 从来没到过 provider。
+        _decision["thinking"] = bool(_reflex_decision.get("think"))
+        _decision["reasoning_effort"] = (
+            "low" if _reflex_decision.get("think") else None
+        )
+        _decision["strength"] = (
+            "low" if _reflex_decision.get("think") else "no_thinking"
+        )
+        _decision["reaction"] = str(_reflex_decision.get("reaction") or "small")
+        _decision["max_tokens"] = _cortex.REACTION_MAX_TOKENS.get(
+            _decision["reaction"], 2048
+        )
+        _rx_action = str(_reflex_decision.get("action") or "quiet")
+        _rx_action_label = _rx_action
+        try:
+            for _o in _cortex_store.action_options or []:
+                if str(_o.get("id")) == _rx_action:
+                    _rx_action_label = str(_o.get("label") or _rx_action)
+                    break
+        except Exception:
+            pass
+        _decision["action"] = _rx_action
+        _decision["action_label"] = _rx_action_label
+        _decision["source"] = "reflex"
+        # reflex 给的是离散判断，不是采样后验：不展示 D 的先验置信度。
+        _decision["confidence"] = None
+        _decision["reason"] = f"reflex|{_reflex_decision.get('reason') or ''}"
+        # req 与 BudgetDecision 都是按 D 先验赋的值，必须同步重写，否则
+        # provider 侧（_output_budget 以 _d_budget 为准）仍拿旧预算。
+        req.thinking = bool(_decision["thinking"])
+        req.reasoning_effort = (
+            _decision["reasoning_effort"] if req.thinking else None
+        )
+        req.max_new_tokens = int(_decision["max_tokens"])
+        # Stage-1 吵醒强制不思考优先于小模型：半梦半醒的身体没有余力深想。
+        if _wake is not None and not bool(_wake.get("think")):
+            req.thinking = False
+            req.reasoning_effort = None
+        _quiet_life_turn = bool(
+            _is_proactive and (_decision.get("action") == "think")
+        )
+        if _d_budget is not None:
+            _d_budget = BudgetDecision(
+                tier="reflex",
+                thinking=req.thinking,
+                reasoning_effort=req.reasoning_effort or "low",
+                max_tokens=req.max_new_tokens,
+                source="reflex",
+                confidence=0.0,
+                reason=str(_decision.get("reason") or ""),
+            )
+        log.info(
+            "reflex decision override: thinking=%s reaction=%s action=%s "
+            "max_tokens=%d reason=%s time_wanted=%s",
+            _decision["thinking"],
+            _decision["reaction"],
+            _decision["action"],
+            _decision["max_tokens"],
+            _decision["reason"],
+            bool(_REFLEX_TIME_STATE.get("wanted")),
+        )
         # Reflex-only round: the body keeps the tick AND stays silent —
         # quiet action (or the unbreakable fallback quiet) with think=false.
         # No provider, no main drain; the reflex layer bills its own small
@@ -6624,6 +6781,9 @@ async def _stream_chat_provider(
         ):
             _cortex_store.record_round(_round_id, _round_started_at, time.time(), True, "", "", _round_receipts)
             _cortex_store.save()
+            # 发布最终决策（已被 reflex 覆盖）：面板必须显示"来源 reflex"，
+            # 而不是上一拍 D 先验采样留下的 prior/0%。
+            _publish_d_decision()
             _emit(
                 "quiet",
                 "静 · 快直觉安静轮",
@@ -6677,42 +6837,19 @@ async def _stream_chat_provider(
                 _note_failure("reflex_ledger", exc)
             return
         # Reflex escalation (non-quiet action or think=true): fall through
-        # into the full pipeline below. D's quiet stays advisory in the
-        # prompt (its decision text was already injected into req.system),
-        # the provider runs and the existing finally block does the usual
-        # drain_main / round_tick / record_slow. _reflex_decision stays set
-        # and the next_check_s frame is emitted right before the pipeline's
-        # final end frame (see the tail of this generator).
+        # into the full pipeline below. The override above already rewrote
+        # _decision / req / _d_budget, so the provider runs on the small
+        # model's budget and the finally block does the usual drain_main /
+        # round_tick / record_slow. _reflex_decision stays set and the
+        # next_check_s frame is emitted right before the pipeline's final
+        # end frame (see the tail of this generator).
 
-        # ── reflex 决策覆盖 D 先验采样 ──
-        # 用户裁定：D 的思考强度/持续反应/默认动作由直觉小模型决定，
-        # D 的先验采样只作参考。升级时用 reflex 的 reaction/think
-        # 覆盖 _decision，让主脑拿到小模型给的预算。
-        _decision["thinking"] = bool(_reflex_decision.get("think"))
-        _decision["reasoning_effort"] = (
-            "low" if _reflex_decision.get("think") else None
-        )
-        _decision["strength"] = (
-            "low" if _reflex_decision.get("think") else "no_thinking"
-        )
-        _decision["reaction"] = str(_reflex_decision.get("reaction") or "small")
-        _decision["max_tokens"] = _cortex.REACTION_MAX_TOKENS.get(
-            _decision["reaction"], 2048
-        )
-        _decision["action"] = str(_reflex_decision.get("action") or "quiet")
-        _decision["source"] = "reflex"
-        _decision["reason"] = (
-            f"reflex|{_reflex_decision.get('reason') or ''}"
-        )
-        log.info(
-            "reflex decision override: thinking=%s reaction=%s action=%s "
-            "max_tokens=%d reason=%s",
-            _decision["thinking"],
-            _decision["reaction"],
-            _decision["action"],
-            _decision["max_tokens"],
-            _decision["reason"],
-        )
+    # ── D 决策最终发布（reflex 覆盖之后）───────────────────────────────
+    # 面板与主脑 prompt 看到的是真正裁决这一轮的那份决策：reflex 在场时
+    # 来源显示 reflex，D 先验只在 reflex 缺席/停用时才出头。
+    _d_block = _publish_d_decision()
+    if _d_block:
+        req.system = (req.system or "") + _d_block
 
     if (
         not _rx_gate_armed

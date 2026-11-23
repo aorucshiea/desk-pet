@@ -74,7 +74,11 @@ DEFAULT_REFLEX_PREFILL = "{"
 DEFAULT_REFLEX_MAX_TOKENS = 128
 # Measured p50 ~2.05 s, ~2.72 s under load; 4 s keeps the reflex off the
 # life-tick critical path while leaving tail room before the fallback.
-DEFAULT_REFLEX_TIMEOUT_S = 4.0
+# Production observation (LM Studio also serving the main 35B model): a cold
+# JIT load plus a queued prefill routinely crossed 4.0 s, so EVERY tick fell
+# back to quiet and the small model never decided. 8 s still sits far below
+# the fastest tempo tier (50–70 s) but survives a cold load / short queue.
+DEFAULT_REFLEX_TIMEOUT_S = 8.0
 
 REFLEX_URL_ENV = "PET_REFLEX_URL"
 REFLEX_MODEL_ENV = "PET_REFLEX_MODEL"
@@ -626,6 +630,58 @@ async def reflect(
         }
 
 
+# Cold JIT load is the reflex's real enemy: LM Studio (and llama.cpp servers
+# in general) load lazily on the first request of a model, and on a CPU box a
+# 1.7B GGUF takes longer than the per-tick timeout — every first tick after a
+# boot/模型切换 fell back to quiet and the small model never decided. Prewarm
+# is a separate, generous deadline; it runs in the background at boot.
+PREWARM_TIMEOUT_S = 180.0
+
+
+async def prewarm(
+    config: ReflexConfig,
+    *,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> dict:
+    """Force the reflex model to be resident before the first life tick.
+
+    Sends the cheapest possible request (one token, no json_schema) and
+    returns {"ok": bool, "latency_ms": int, "failure": str}. Never raises.
+    """
+    if not config.enabled:
+        return {"ok": False, "failure": "reflex_disabled"}
+    payload = {
+        "model": config.model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "stream": False,
+    }
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(PREWARM_TIMEOUT_S),
+            transport=transport,
+            trust_env=False,
+        ) as http:
+            resp = await http.post(
+                config.url.rstrip("/") + REFLEX_ENDPOINT,
+                json=payload,
+                headers=_auth_headers(config.api_key),
+            )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        if resp.status_code != 200:
+            return {"ok": False, "latency_ms": latency_ms,
+                    "failure": f"http_{resp.status_code}"}
+        return {"ok": True, "latency_ms": latency_ms, "failure": ""}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "failure": f"error:{type(exc).__name__}",
+        }
+
+
 __all__ = [
     "ACTIONS",
     "DEFAULT_REFLECT_MAX_TOKENS",
@@ -635,6 +691,7 @@ __all__ = [
     "DEFAULT_REFLEX_PREFILL",
     "DEFAULT_REFLEX_TIMEOUT_S",
     "DEFAULT_REFLEX_URL",
+    "PREWARM_TIMEOUT_S",
     "REFLEX_ENABLED_ENV",
     "REFLEX_MODEL_ENV",
     "REFLEX_URL_ENV",
@@ -645,5 +702,6 @@ __all__ = [
     "build_user_prompt",
     "judge",
     "load_reflex_config",
+    "prewarm",
     "reflect",
 ]

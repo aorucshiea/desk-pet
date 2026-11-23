@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from typing import Any
 
 import pytest
@@ -73,6 +75,10 @@ def _isolate_life_state(monkeypatch, tmp_path):
     server_mod._DENSITY_EVENTS.clear()
     server_mod._pending_vitals_round.clear()
     server_mod._pending_vitals_round.update({"organize_kind": None, "overflow": False})
+    # The time-sense latch is module state: a previous test asking for the
+    # clock must never leak a current_time line into the next test's state.
+    server_mod._REFLEX_TIME_STATE.clear()
+    server_mod._REFLEX_TIME_STATE.update({"wanted": False, "asked_at": 0.0})
     # Never let a built app's boot singleton (or a previous test's shadow)
     # decide whether this test's reflex gate is armed.
     server_mod._reflex_config_ref.pop("cfg", None)
@@ -739,3 +745,175 @@ def test_emitted_next_check_s_stays_inside_tier(life, monkeypatch, tmp_path, mod
     # The tempo SSE frame carries the same mode the state saw.
     tempo_frames = [f for f in frames if f.get("event") == "tempo"]
     assert tempo_frames and tempo_frames[0]["mode"] == mode
+
+
+# ── 10. Reflex is the SOLE decision maker: budget reaches the provider ──
+
+
+def test_reflex_override_reaches_provider_budget_and_prompt(life, monkeypatch, tmp_path):
+    """The small model's think/reaction must reach the provider.
+
+    Regression: the override used to run after ``req.thinking`` /
+    ``_d_budget`` were already assigned from D's prior sampling, so the
+    reflex budget was written to the log only — the provider kept running on
+    prior D. The window here returns large+think while D's prior says
+    small+no_thinking.
+    """
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    _arm(monkeypatch, {
+        "action": "speak", "think": True, "next_check_s": 90,
+        "reaction": "large", "reason": "想说长一点", "source": "reflex",
+        "time_relevant": False, "time_note": "",
+    })
+    provider = _RecordingOpenAI([[
+        {"type": "delta", "content": "（这次要好好说。）"},
+        {"type": "end"},
+    ]])
+    _install(monkeypatch, provider, passive=_passive(
+        action="quiet", strength="no_thinking", reaction="small", max_tokens=2048,
+    ))
+
+    frames = _run(provider, _req(messages=_PROACTIVE))
+
+    assert frames[-1]["event"] == "end"
+    assert len(provider.calls) == 1
+    call = provider.calls[0]
+    # Provider-side budget is the reflex decision, not D's prior.
+    assert call["max_tokens"] == cortex.REACTION_MAX_TOKENS["large"]
+    assert call["thinking_override"] is True
+    assert call["reasoning_effort_override"] == "low"
+    # The prompt the main brain actually reads also carries reflex's text.
+    assert "思考强度：low" in call["system"]
+    assert "持续反应：大" in call["system"]
+    assert f"max_tokens={cortex.REACTION_MAX_TOKENS['large']}" in call["system"]
+    # Brain panel: ONE d_decision, already the reflex-overridden one.
+    d_events = [e for e in brain_mod.snapshot() if e["type"] == "d_decision"]
+    assert len(d_events) == 1
+    meta = d_events[0]["meta"]
+    assert meta["source"] == "reflex"
+    assert meta["strength"] == "low"
+    assert meta["reaction"] == "large"
+    assert meta["max_tokens"] == cortex.REACTION_MAX_TOKENS["large"]
+    # Reflex answers are discrete judgments, not sampled posteriors: no chip.
+    assert meta.get("confidence") is None
+    # 面板"延迟"报的是真正裁决者（小模型）的整拍耗时，不是 D 那条已经
+    # 没用的 Laya 尝试的耗时（否则会显示成 2 秒的假延迟）。
+    assert meta["latency_ms"] < 1000.0
+
+
+def test_reflex_quiet_publishes_reflex_decision_to_brain(life, monkeypatch, tmp_path):
+    """The quiet path publishes the final decision too — no stale prior line."""
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    _arm(monkeypatch, {
+        "action": "quiet", "think": False, "next_check_s": 300,
+        "reason": "继续待着", "source": "reflex",
+        "time_relevant": False, "time_note": "",
+    })
+    provider = _RecordingOpenAI([[
+        {"type": "delta", "content": "不该出现"},
+        {"type": "end"},
+    ]])
+    _install(monkeypatch, provider, passive=_passive(
+        action="speak", strength="no_thinking", reaction="small",
+    ))
+    frames = _run(provider, _req(messages=_PROACTIVE))
+    assert _events(frames) == [
+        "start", "tempo", "next_check_s", "quiet", "inner", "end",
+    ]
+    d_events = [e for e in brain_mod.snapshot() if e["type"] == "d_decision"]
+    assert len(d_events) == 1
+    meta = d_events[0]["meta"]
+    assert meta["source"] == "reflex"
+    assert meta["action"] == "quiet"
+    assert meta.get("confidence") is None
+
+
+# ── 11. Model-decided time sense: closed loop across ticks ──────────
+
+
+def _scripted_arm(monkeypatch, judged_sequence: list[dict]) -> list[dict]:
+    calls: list[dict] = []
+    pending = list(judged_sequence)
+
+    async def _judge(state, config, **kwargs):
+        calls.append({"state": dict(state), "config": config})
+        if pending:
+            return dict(pending.pop(0))
+        return {
+            "action": "quiet", "think": False, "next_check_s": 300,
+            "reason": "", "source": "reflex",
+            "time_relevant": False, "time_note": "",
+        }
+
+    monkeypatch.setattr(
+        server_mod._reflex_module, "judge", _judge, raising=False
+    )
+    server_mod.set_reflex_config_override(
+        ReflexConfig(
+            url="http://127.0.1:1234/v1", model="lfm3-1.7b",
+            api_key="lm-studio", prefill="{", max_tokens=128,
+            timeout_s=4.0, enabled=True,
+        )
+    )
+    return calls
+
+
+def test_time_sense_is_model_requested_and_granted_next_tick(life, monkeypatch, tmp_path):
+    """The clock is never pushed: tick N asks, tick N+1 receives.
+
+    Regression: the grant read the per-round ``_reflex_decision`` local that
+    was reset to None before the check, so ``time_relevant=true`` never
+    unlocked anything.
+    """
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    calls = _scripted_arm(monkeypatch, [
+        {"action": "quiet", "think": False, "next_check_s": 300,
+         "reason": "想知道现在几点", "source": "reflex",
+         "time_relevant": True, "time_note": "上一轮大概是 20 分钟前"},
+        {"action": "quiet", "think": False, "next_check_s": 300,
+         "reason": "拿到时间了", "source": "reflex",
+         "time_relevant": False, "time_note": ""},
+    ])
+    provider = _RecordingOpenAI([[{"type": "delta", "content": "x"}, {"type": "end"}]])
+    _install(monkeypatch, provider, passive=_passive(action="quiet"))
+
+    # Tick 1: the model asks. It gets NO clock (nothing was requested before).
+    _run(provider, _req(messages=_PROACTIVE))
+    assert "current_time" not in calls[0]["state"]
+    assert "elapsed_since_main_s" not in calls[0]["state"]
+
+    # A main-brain round happened 11 minutes ago (elapsed_since_main_s anchor).
+    server_mod._DENSITY_STATE["last_round_at"] = time.time() - 660.0
+
+    # Tick 2: the request from tick 1 is honored — clock + elapsed are attached.
+    _run(provider, _req(messages=_PROACTIVE))
+    assert re.fullmatch(r"\d{2}:\d{2}", calls[1]["state"]["current_time"])
+    assert calls[1]["state"]["elapsed_since_main_s"] >= 600
+
+    # Tick 3: the model said false on tick 2, so the clock is gone again.
+    _run(provider, _req(messages=_PROACTIVE))
+    assert "current_time" not in calls[2]["state"]
+    assert "elapsed_since_main_s" not in calls[2]["state"]
+
+
+def test_time_sense_latch_survives_fallback(life, monkeypatch, tmp_path):
+    """A fallback tick also persists the (false) time decision — no ghost grant."""
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    calls = _scripted_arm(monkeypatch, [
+        {"action": "quiet", "think": False, "next_check_s": 300,
+         "reason": "", "source": "fallback", "failure": "timeout"},
+    ])
+    provider = _RecordingOpenAI([[{"type": "delta", "content": "x"}, {"type": "end"}]])
+    _install(monkeypatch, provider, passive=_passive(action="quiet"))
+    _run(provider, _req(messages=_PROACTIVE))
+    assert server_mod._REFLEX_TIME_STATE["wanted"] is False
+    _run(provider, _req(messages=_PROACTIVE))
+    assert "current_time" not in calls[1]["state"]

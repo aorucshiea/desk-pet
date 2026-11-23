@@ -28,6 +28,7 @@ from gateway.decision.reflex import (
     build_user_prompt,
     judge,
     load_reflex_config,
+    prewarm,
 )
 
 # TEMPO_RANGE_S must keep mirroring server.py _TEMPO_SPECS["interval_s"]
@@ -93,7 +94,7 @@ def test_defaults_when_providers_json_missing(tmp_path):
     assert config.enabled is True
     assert config.prefill == "{"
     assert config.max_tokens == 128
-    assert config.timeout_s == pytest.approx(4.0)
+    assert config.timeout_s == pytest.approx(8.0)
     assert config.api_key == "lm-studio"
 
 
@@ -576,3 +577,47 @@ def test_user_prompt_caps_recent_thoughts_at_three():
     )
     assert "一；二；三" in prompt
     assert "四" not in prompt
+
+
+# ── 预热（冷加载才是每拍回落的真凶）────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_prewarm_sends_cheapest_request_and_reports_latency():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "h"}}]
+        })
+
+    out = await prewarm(_config(), transport=httpx.MockTransport(handler))
+    assert out["ok"] is True
+    assert out["failure"] == ""
+    assert isinstance(out["latency_ms"], int)
+    body = seen["body"]
+    assert body["model"] == "lfm3-1.7b"
+    assert body["max_tokens"] == 1
+    # 预热不做 prefill / json_schema：它只要把模型顶进内存
+    assert body["messages"][-1]["role"] == "user"
+    assert "response_format" not in body
+
+
+@pytest.mark.asyncio
+async def test_prewarm_disabled_makes_no_request():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("disabled config must not fire a request")
+
+    out = await prewarm(_config(enabled=False), transport=httpx.MockTransport(handler))
+    assert out == {"ok": False, "failure": "reflex_disabled"}
+
+
+@pytest.mark.asyncio
+async def test_prewarm_failure_never_raises():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down", request=request)
+
+    out = await prewarm(_config(), transport=httpx.MockTransport(handler))
+    assert out["ok"] is False
+    assert out["failure"].startswith("error:")
