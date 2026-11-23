@@ -74,12 +74,12 @@ DEFAULT_REFLEX_PREFILL = "{"
 DEFAULT_REFLEX_MAX_TOKENS = 128
 # Measured p50 ~2.05 s in a clean benchmark; IN PRODUCTION the same request
 # shape (system + state + prefill + strict json_schema, 128 tokens) measured
-# 7–11 s while the main 35B model shares the LM Studio box (CPU-only, both
+# 7–20 s while the main 35B model shares the LM Studio box (CPU-only, both
 # models resident). The production measurement, not the benchmark, is what
 # matters: at 4 s / 8 s EVERY tick fell back to quiet and the small model
-# never decided. 20 s still fits the fastest tempo tier (50–70 s) and leaves
-# the fallback for a genuinely dead endpoint.
-DEFAULT_REFLEX_TIMEOUT_S = 20.0
+# never decided. 25 s still fits the fastest tempo tier (50–70 s), so a slow
+# tick costs cadence, never correctness; the fallback stays for a dead endpoint.
+DEFAULT_REFLEX_TIMEOUT_S = 25.0
 
 REFLEX_URL_ENV = "PET_REFLEX_URL"
 REFLEX_MODEL_ENV = "PET_REFLEX_MODEL"
@@ -161,14 +161,6 @@ _SYSTEM_PROMPT = """你是桌宠的快直觉核心（潜意识）。职责：用
 - time_doing：你之前或者刚刚在做什么？看状态摘要与最近心声，用一行短句回答（不超过20字），不知道就空字符串。
 - time_relevant：这件事跟时间有关吗？只有确实需要知道现在的时间（比如睡觉、等待、日常节奏）才为 true；其他情况 false。系统只在你标记 true 后才把时间给你。
 - time_note：你觉得“之前/刚刚做的事已经过去了多久”的估计（用最近心声的时间线推）；不知道就留空字符串。
-
-【D 的固定问题】（前 3 问决定这一拍，后 3 问决定你的时间感；全部必答）
-1. 这一拍用多强的思考？→ think
-2. 这一拍正文写多长？→ reaction
-3. 接下来最自然的默认动作？→ action
-4. 之前或者刚刚我在做什么？→ time_doing
-5. 我需要知道现在的时间吗？→ time_relevant
-6. 我之前或者刚刚做的事情已经过去了多久？→ time_note
 
 节奏锚定（next_check_s 必须落在当前档位区间内，用户消息会给出当前档位）：
 - slow：240–360 秒；fast：90–150 秒；ultra：50–70 秒。

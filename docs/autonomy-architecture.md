@@ -129,7 +129,13 @@ AI 自主决定睡眠 ≥4 小时；系统强制 = 8 小时。睡眠中只有说
 轮 = 生命节拍一次 tick，全局计数永不归零。每 500 轮强制主脑整理轮（**记忆审查 / 阶段回顾交替**——回顾覆盖**最近 100 轮**，台账条目作为材料注入 prompt；回顾挂到下一条用户消息）。删除只动快直觉条目（周期最多 100 条）；慢直觉条目永久保留，溢出保险（慢台账 ≥400 → 每轮删 10 条至 200 条，同时休息提醒升级——台账满必然主脑干了海量活，电量压力与上下文压力在此汇合：两个系统指向同一个结局：睡觉）。
 
 ### 6. 快直觉核心（`decision/reflex.py` + Laya 分工重划）
-小 LLM（lfm3-1.7b @ LM Studio）= 快直觉：每次主动 tick 先做一次便宜判断（strict-JSON，prefill `{` + json_schema 配方 = 实测 100% 合规），quiet 轮终止于它（`drain_small` 半价 + `record_fast` 一行台账），`think=true` 才唤醒主脑。**Laya 退役为密度计候选**——它 58–67% 的四选一准确率只配做统计路由；`frame.py`/`laya_router.py` 死代码待吸收删除。主脑 = 慢直觉（前额叶），只做真正的推理与措辞。
+小 LLM（lfm3-1.7b @ LM Studio）= 快直觉，也是 **D 的唯一决策者**：每次主动 tick 先做一次便宜判断（strict-JSON，prefill `{` + json_schema 配方 = 实测 100% 合规），quiet 轮终止于它（`drain_small` 半价 + `record_fast` 一行台账），`think=true` 才唤醒主脑。**Laya 退役为密度计候选**——它 58–67% 的四选一准确率只配做统计路由；`frame.py`/`laya_router.py` 死代码待吸收删除。主脑 = 慢直觉（前额叶），只做真正的推理与措辞。
+
+**D 的固定六问**（不再是三问，第 4–6 问是时间感）：1 思考强度 → `think`；2 正文篇幅 → `reaction`；3 默认动作 → `action`；4 之前/刚刚在做什么 → `time_doing`；5 我需要知道现在的时间吗 → `time_relevant`；6 那件事过去了多久 → `time_note`。六问全部必答（`reflex._REFLEX_SCHEMA.required` / `cortex.FIXED_QUESTION_ORDER`），答案一起进 D 面板、台账快条目和主脑 prompt（`cortex.decision_to_prompt`：空答案不占字数）。**授时是模型求时才给**：`time_relevant=true` 的那一拍只落闩锁，下一拍系统才注入 `current_time` 与 `elapsed_since_main_s`（`server._REFLEX_TIME_STATE`）——时间感是它自己开口要的，不是系统塞的。
+
+**两种模态**：短决策（tick 判断、触摸反应词）走 `judge()` 的非思考配方（prefill + strict schema，64–128 token）；其余小模型工作走 `reflect()` 的思考档（不 prefill、512 token）。暂时不要用思考档做短输出：实测同一条"一句反应"走思考档要 18 s，还把预算全烧在推理上、正文为空。
+
+**生产实测**：LM Studio 与主脑 35B 共用一台 CPU 机器时，同一条 tick 请求 7–25 s（基准机上 p50 2.05 s）。所以 `DEFAULT_REFLEX_TIMEOUT_S = 25`，并在 lifespan 里做一次 `prewarm()` 顶掉冷加载——否则每拍都超时回落，小模型等于没上过岗。真正的提速要把主脑让出 LM Studio（或换云端 provider）。
 
 ## 尚缺的器官（路线图）
 

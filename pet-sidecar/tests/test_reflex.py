@@ -94,7 +94,7 @@ def test_defaults_when_providers_json_missing(tmp_path):
     assert config.enabled is True
     assert config.prefill == "{"
     assert config.max_tokens == 128
-    assert config.timeout_s == pytest.approx(20.0)
+    assert config.timeout_s == pytest.approx(25.0)
     assert config.api_key == "lm-studio"
 
 
@@ -747,3 +747,4 @@ async def test_prewarm_failure_never_raises():
     out = await prewarm(_config(), transport=httpx.MockTransport(handler))
     assert out["ok"] is False
     assert out["failure"].startswith("error:")
+
