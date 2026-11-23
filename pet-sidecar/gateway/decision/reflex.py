@@ -84,6 +84,20 @@ DEFAULT_REFLEX_TIMEOUT_S = 25.0
 REFLEX_URL_ENV = "PET_REFLEX_URL"
 REFLEX_MODEL_ENV = "PET_REFLEX_MODEL"
 REFLEX_ENABLED_ENV = "PET_REFLEX_ENABLED"
+REFLEX_VISION_ENV = "PET_REFLEX_VISION"
+
+# Model ids that can actually consume the round frame. Deliberately narrow:
+# "vl" appears inside many vision model names (qwen-vl, lfm3-vl) and "omni"
+# models are multimodal too; "-v-" catches the minicpm-v family. A plain
+# text model must never receive an image (LM Studio either errors or
+# silently drops it).
+_VISION_MODEL_MARKERS = ("vl", "vision", "omni", "-v-")
+
+
+def _model_has_vision(model: str) -> bool:
+    """Best-effort vision capability guess from the model id."""
+    lowered = str(model or "").lower()
+    return any(marker in lowered for marker in _VISION_MODEL_MARKERS)
 
 REFLEX_ENDPOINT = "/chat/completions"
 
@@ -158,16 +172,18 @@ _SYSTEM_PROMPT = """你是桌宠的快直觉核心（潜意识）。职责：用
 - reaction：升级时大脑的持续反应力度。small=简短回应(1536 tok)、medium=中等(2560 tok)、large=深入(4096 tok)。quiet 时选 small。
 - next_check_s：距下次自查的秒数，必须落在当前节奏档内。
 - reason：最关键的一句话，不超过20个中文字；升级（非 quiet/非 think=false）时必须写出理由。
-- time_doing：你之前或者刚刚在做什么？看状态摘要与最近心声，用一行短句回答（不超过20字），不知道就空字符串。
+- time_doing：你之前或者刚刚在做什么？看状态摘要、最近心声和本轮视锥画面，用一行短句回答（不超过20字），不知道就空字符串。
 - time_relevant：这件事跟时间有关吗？只有确实需要知道现在的时间（比如睡觉、等待、日常节奏）才为 true；其他情况 false。系统只在你标记 true 后才把时间给你。
 - time_note：你觉得“之前/刚刚做的事已经过去了多久”的估计（用最近心声的时间线推）；不知道就留空字符串。
+
+视锥画面（如果消息里附了图）：那是你这一拍眼睛看到的画面，和主脑稍后看到的是同一张。瞥一眼即可——只有画面里出现明显值得反应的东西（人靠近、突然变化、你在意的东西）才考虑升级；平凡画面就当没看见，不要因为"有东西"就说话或走动。
 
 节奏锚定（next_check_s 必须落在当前档位区间内，用户消息会给出当前档位）：
 - slow：240–360 秒；fast：90–150 秒；ultra：50–70 秒。
 
 校准指导：
 - 深夜安静、没有新事件、用户不在：action=quiet、think=false，next_check_s 靠近档位上限（slow 档取 330–360）。
-- 只有出现新事件、用户在场、或强烈的直觉时才升级 action 或 think=true；不要无缘无故地看或走。
+- 只有出现新事件、用户在场、强烈的直觉、或视锥里出现值得反应的东西时才升级 action 或 think=true；不要无缘无故地看或走。
 - 升级时根据事情的重要程度选 reaction：小事 small、需要认真回复 medium、复杂问题 large。
 - 不要连续多轮输出相同的 action；最近心声显示上一轮已做过某动作时，本轮换一种更合适的方式。
 - 拿不准就选更省的一项：quiet、think=false、reaction=small、档位内偏大的 next_check_s。"""
@@ -175,7 +191,12 @@ _SYSTEM_PROMPT = """你是桌宠的快直觉核心（潜意识）。职责：用
 
 @dataclass(frozen=True, slots=True)
 class ReflexConfig:
-    """Resolved reflex settings (env > providers.json "reflex" > defaults)."""
+    """Resolved reflex settings (env > providers.json "reflex" > defaults).
+
+    ``vision``: attach the round's vision-cone frame to judge() requests.
+    Resolution: env/providers.json explicit value wins; otherwise auto-
+    detected from the model id (vl / vision / omni in the name → on).
+    """
 
     url: str = DEFAULT_REFLEX_URL
     model: str = DEFAULT_REFLEX_MODEL
@@ -184,6 +205,7 @@ class ReflexConfig:
     max_tokens: int = DEFAULT_REFLEX_MAX_TOKENS
     timeout_s: float = DEFAULT_REFLEX_TIMEOUT_S
     enabled: bool = True
+    vision: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -194,6 +216,7 @@ class ReflexConfig:
             "max_tokens": self.max_tokens,
             "timeout_s": self.timeout_s,
             "enabled": self.enabled,
+            "vision": self.vision,
         }
 
 
@@ -264,6 +287,17 @@ def load_reflex_config(
 
     api_key = _section_str(section, "apiKey") or DEFAULT_REFLEX_API_KEY
 
+    # Vision: explicit env/providers.json value wins; otherwise auto-detect
+    # from the model id — a VL/omni model gets the round's vision cone by
+    # default (the small model IS the eye when it can see).
+    env_vision = str(env_map.get(REFLEX_VISION_ENV) or "").strip().lower()
+    if env_vision:
+        vision = env_vision not in _DISABLED_WORDS
+    elif "vision" in section:
+        vision = _flag(section.get("vision"), False)
+    else:
+        vision = _model_has_vision(model)
+
     return ReflexConfig(
         url=url,
         model=model,
@@ -272,6 +306,7 @@ def load_reflex_config(
         max_tokens=DEFAULT_REFLEX_MAX_TOKENS,
         timeout_s=DEFAULT_REFLEX_TIMEOUT_S,
         enabled=enabled,
+        vision=vision,
     )
 
 
@@ -317,6 +352,9 @@ def build_user_prompt(state: Mapping[str, Any], tier: str) -> str:
         f"心情：{str(state.get('mood') or '').strip() or '平静'}",
         "最近心声：" + ("；".join(thoughts) if thoughts else "（无）"),
     ]
+    # 视锥画面：state 带了本轮帧时，文字里点名它的存在（图片本体在消息里）。
+    if str(state.get("image_b64") or "").strip():
+        lines.append("视锥画面：见消息附图（本轮开头拍的，和主脑同一张）。")
     # 时间是"模型求时才给"：只有上一轮它标了 time_relevant，这一轮才附。
     current_time = str(state.get("current_time") or "").strip()
     if current_time:
@@ -328,12 +366,26 @@ def build_user_prompt(state: Mapping[str, Any], tier: str) -> str:
 
 
 def _build_payload(state: Mapping[str, Any], tier: str, config: ReflexConfig) -> dict:
-    """The exact production request shape for lfm3-1.7b (see module docstring)."""
+    """The exact production request shape for the reflex model.
+
+    Text-only models (lfm3-1.7b): three plain messages. Vision models with
+    this round's frame in state: the user message becomes multimodal parts
+    carrying the SAME image the main brain will see if it escalates.
+    """
+    prompt_text = build_user_prompt(state, tier)
+    image_b64 = str(state.get("image_b64") or "").strip()
+    if config.vision and image_b64:
+        user_content: Any = [
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]
+    else:
+        user_content = prompt_text
     return {
         "model": config.model,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(state, tier)},
+            {"role": "user", "content": user_content},
             # THE lever: partial assistant turn continues straight into JSON.
             {"role": "assistant", "content": config.prefill},
         ],
@@ -889,6 +941,7 @@ __all__ = [
     "REFLEX_ENABLED_ENV",
     "REFLEX_MODEL_ENV",
     "REFLEX_URL_ENV",
+    "REFLEX_VISION_ENV",
     "TEMPO_DEFAULT",
     "TEMPO_RANGE_S",
     "TOUCH_REACTION_MAX_CHARS",

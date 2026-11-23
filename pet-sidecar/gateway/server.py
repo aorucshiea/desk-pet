@@ -1224,6 +1224,9 @@ def build_app(
     # = AI-agent style per-action authorization dialogs.
     _boot_consent = os.environ.get("PET_SCREEN_CONSENT", "deny")
     consent_state: str = _boot_consent if _boot_consent in ("deny", "once", "always") else "deny"
+    # Ambient eyes (每轮视锥同帧) share this consent: boot value seeds the
+    # module holder, set_consent keeps it in sync.
+    set_screen_eyes(consent_state)
     consent_lock = asyncio.Lock()
     omniparser_manager = OmniParserManager()
 
@@ -4205,6 +4208,7 @@ def build_app(
             return JSONResponse({"error": f"invalid consent: {value}"}, status_code=400)
         async with consent_lock:
             consent_state = value
+        set_screen_eyes(consent_state)
         return {"current_consent": consent_state}
 
     @app.get("/api/screen/consent-status")
@@ -4224,6 +4228,7 @@ def build_app(
         if remember:
             async with consent_lock:
                 consent_state = "always"
+            set_screen_eyes(consent_state)
         return result
 
     @app.post("/api/screen/observe")
@@ -4713,6 +4718,89 @@ async def _pet_view_for_capture() -> Optional[dict]:
             return None
         return {"pet": pet, "facing": data.get("facing") or "right", "wa": wa}
     except Exception:
+        return None
+
+
+# ── 每轮视锥同帧（round frame）────────────────────────────────────────
+# 用户裁定：默认每轮都把视锥图片交给系统——快直觉（小模型）看图，慢直觉
+# （主脑）看图，且一轮中必须是同一张图。所以每轮开头只截一次，存进
+# _round_frame 局部，两个消费者都读这一份；快直觉安静轮它只给快直觉，
+# 升级轮主脑拿到的也是这同一张（不是快直觉看完后重拍的）。
+# 授权：跟随屏幕观察授权（PET_SCREEN_CONSENT / set_consent）。deny=闭眼，
+# once 不在自动帧里消费（once 是显式动作的授权）。
+_SCREEN_EYES_HOLDER: dict = {"state": None}
+
+_ROUND_FRAME_MAX_SIDE = 768  # same as capture_screen's default view
+
+
+def _eyes_allowed() -> bool:
+    return str(_SCREEN_EYES_HOLDER.get("state") or "") == "always"
+
+
+def set_screen_eyes(state: Optional[str]) -> None:
+    """Update the ambient-eyes consent (called by build_app + consent API)."""
+    _SCREEN_EYES_HOLDER["state"] = (
+        state if state in ("deny", "once", "always") else None
+    )
+
+
+async def _capture_round_frame() -> Optional[dict]:
+    """One vision-cone capture for THIS round. Never raises.
+
+    Returns {"b64", "mime", "used_cone", "ts"} or None (consent deny /
+    capture failure / no geometry). The cone crop is the same view the
+    capture_screen tool shows by default — the pet's own eyes, not the
+    whole desktop.
+    """
+    if not _eyes_allowed():
+        return None
+    try:
+        full = await asyncio.to_thread(screen_capture)
+        view = await _pet_view_for_capture()
+        used_cone = False
+        b64 = full
+        if view is not None:
+            cropped = await asyncio.to_thread(
+                crop_to_vision_cone,
+                full,
+                view["pet"],
+                view["facing"],
+                view["wa"],
+            )
+            if cropped:
+                b64 = cropped
+                used_cone = True
+        if not used_cone:
+            # No geometry (shell offline) → fall back to the full screen,
+            # downscaled: seeing something beats seeing nothing.
+            try:
+                import io as _io
+                from PIL import Image as _Image
+
+                img = _Image.open(_io.BytesIO(base64.b64decode(full)))
+                if max(img.size) > _ROUND_FRAME_MAX_SIDE:
+                    ratio = _ROUND_FRAME_MAX_SIDE / max(img.size)
+                    img = img.resize(
+                        (int(img.size[0] * ratio), int(img.size[1] * ratio)),
+                        _Image.LANCZOS,
+                    )
+                img = img.convert("RGB")
+                buf = _io.BytesIO()
+                img.save(buf, format="JPEG", quality=70)
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception:
+                b64 = full
+        frame = {
+            "b64": b64,
+            "mime": "image/jpeg",
+            "used_cone": used_cone,
+            "ts": time.time(),
+        }
+        telemetry.inc("round_frame.captured")
+        telemetry.gauge("round_frame.bytes", len(b64))
+        return frame
+    except Exception as exc:
+        _note_failure("round_frame_capture", exc)
         return None
 
 
@@ -6252,6 +6340,18 @@ async def _stream_chat_provider(
     # tick). A short-circuited tick is not a life round: no drain, no ledger
     # tick, no ledger entry — the finally block reads this flag.
     _vitals_short_circuited = False
+    # ── 每轮视锥同帧（用户裁定）──────────────────────────────────────
+    # 默认每轮只截一次视锥：快直觉（小模型）与稍后可能升级的主脑看同一
+    # 张图。闭眼条件：屏幕授权 deny / silent 轮。失败只是 None，绝不挡轮。
+    _round_frame: Optional[dict] = None
+    if not req.silent:
+        _round_frame = await _capture_round_frame()
+        if _round_frame is not None:
+            log.info(
+                "round frame captured: cone=%s bytes=%d",
+                bool(_round_frame.get("used_cone")),
+                len(_round_frame.get("b64") or ""),
+            )
     # ── 上一轮 tick 留下的待办（点 7/9）──────────────────────────────
     # organize_kind：上一轮 round_tick 刚跨过 500 的倍数 → 本轮（下一个
     # 主动轮）变成记忆整理轮，读到即消费（本轮 finally 的 tick 会重写
@@ -6742,6 +6842,11 @@ async def _stream_chat_provider(
             "d_action": str(_decision.get("action") or "quiet"),
             "user_ago_s": round(_user_ago, 1) if _last_user_at > 0 else None,
         }
+        # 本轮视锥同帧：快直觉的眼睛。config.vision 决定是否真的附图
+        # （纯文本模型忽略它），同一张 b64 在升级时会交给主脑。
+        if _round_frame is not None:
+            _reflex_state["image_b64"] = str(_round_frame.get("b64") or "")
+            _reflex_state["frame_used_cone"] = bool(_round_frame.get("used_cone"))
         # 授时闭环：只有上一轮小模型自己标了 time_relevant（它说"我需要
         # 知道时间"），这一轮才附上当前时间和距上次主脑轮的时长。不主动
         # 报时——时间感是模型自己的选择，不是系统塞给它的。闩锁必须跨轮
@@ -7111,6 +7216,34 @@ async def _stream_chat_provider(
         _conversation_state["last_conversation_at"] = datetime.now(timezone.utc)
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
+
+    # ── 每轮视锥同帧 → 主脑的眼睛 ─────────────────────────────────────
+    # 本轮开头已经截过一次视锥（快直觉看的就是它）。升级到主脑时把同一张
+    # b64 附在消息尾部：不是重拍、不是裁剪变体——一轮一帧是硬约束。
+    # 只在当前 provider 真能收图时注入（与 capture_screen 同一能力检查）。
+    if _round_frame and _can_see_images():
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "【本轮视锥画面】这是这一轮开头你眼睛看到的画面"
+                        + ("（你的视锥方向）" if _round_frame.get("used_cone") else "（整块屏幕）")
+                        + "，快直觉看的就是同一张。它是背景存在感："
+                        "不用描述、不用复述，除非画面跟你这轮要做的事有关。"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{_round_frame.get('mime') or 'image/jpeg'};base64,"
+                               f"{_round_frame.get('b64') or ''}"
+                    },
+                },
+            ],
+        })
+        telemetry.inc("round_frame.delivered_main")
 
     # Proactive-request detection (说话冲动的冷场计数): the renderer's
     # wake-up prompt arrives as a user message starting with [系统提示.

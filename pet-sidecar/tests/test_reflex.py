@@ -79,7 +79,7 @@ def _isolate_env(monkeypatch, tmp_path):
     monkeypatch.setattr(
         reflex, "_default_providers_path", lambda: tmp_path / "providers.json"
     )
-    for name in ("PET_REFLEX_URL", "PET_REFLEX_MODEL", "PET_REFLEX_ENABLED"):
+    for name in ("PET_REFLEX_URL", "PET_REFLEX_MODEL", "PET_REFLEX_ENABLED", "PET_REFLEX_VISION"):
         monkeypatch.delenv(name, raising=False)
     yield
 
@@ -703,6 +703,94 @@ async def test_touch_reaction_empty_content_is_a_fallback():
         "用户戳了你 1 下", _config(), transport=httpx.MockTransport(handler)
     )
     assert out["source"] == "fallback" and out["failure"] == "empty_text"
+
+
+# ── 视觉（每轮视锥同帧：小模型是眼睛时才收图）──────────────────────────
+
+
+def test_model_vision_detection_is_narrow():
+    assert reflex._model_has_vision("lfm3-vl-2b")
+    assert reflex._model_has_vision("qwen3-vl-8b")
+    assert reflex._model_has_vision("lfm3-omni-2b")
+    assert reflex._model_has_vision("Minicpm-V-2.6")
+    # 纯文本模型绝不能误判
+    assert not reflex._model_has_vision("lfm3-1.7b")
+    assert not reflex._model_has_vision("minicpm5-2b")
+    assert not reflex._model_has_vision("ornith-1.5-35b-a3b")
+
+
+def test_load_reflex_config_vision_resolution(tmp_path, monkeypatch):
+    """vision：显式配置 > 模型名自动判定（vl/omni → 收图）。"""
+    # 自动：VL 模型默认开
+    path = tmp_path / "p1.json"
+    path.write_text(json.dumps({"reflex": {"model": "lfm3-vl-2b"}}), encoding="utf-8")
+    assert load_reflex_config(path).vision is True
+    # 自动：纯文本模型默认关
+    path2 = tmp_path / "p2.json"
+    path2.write_text(json.dumps({"reflex": {"model": "lfm3-1.7b"}}), encoding="utf-8")
+    assert load_reflex_config(path2).vision is False
+    # 显式覆盖自动判定（两个方向）
+    path3 = tmp_path / "p3.json"
+    path3.write_text(json.dumps({"reflex": {"model": "lfm3-1.7b", "vision": True}}), encoding="utf-8")
+    assert load_reflex_config(path3).vision is True
+    path4 = tmp_path / "p4.json"
+    path4.write_text(json.dumps({"reflex": {"model": "lfm3-vl-2b", "vision": False}}), encoding="utf-8")
+    assert load_reflex_config(path4).vision is False
+    # env 最高优先
+    monkeypatch.setenv("PET_REFLEX_VISION", "0")
+    assert load_reflex_config(path).vision is False
+    monkeypatch.setenv("PET_REFLEX_VISION", "1")
+    assert load_reflex_config(path2).vision is True
+
+
+def _state_with_frame() -> dict:
+    return dict(_NIGHT_STATE, image_b64="Q1JPUA==")
+
+
+def test_build_payload_vision_model_carries_the_frame():
+    prompt = build_user_prompt(_state_with_frame(), "slow")
+    assert "视锥画面：见消息附图（本轮开头拍的，和主脑同一张）。" in prompt
+    payload = reflex._build_payload(_state_with_frame(), "slow", _config(vision=True))
+    user_msg = payload["messages"][1]
+    assert user_msg["role"] == "user"
+    assert isinstance(user_msg["content"], list)
+    text_part, image_part = user_msg["content"]
+    assert text_part["type"] == "text" and "视锥画面" in text_part["text"]
+    assert image_part["type"] == "image_url"
+    assert image_part["image_url"]["url"] == "data:image/jpeg;base64,Q1JPUA=="
+    # prefill 与 schema 不变
+    assert payload["messages"][-1] == {"role": "assistant", "content": "{"}
+    assert payload["response_format"]["type"] == "json_schema"
+
+
+def test_build_payload_text_model_ignores_the_frame():
+    """纯文本模型绝不收图（LM Studio 会报错或静默丢弃）。"""
+    prompt = build_user_prompt(_state_with_frame(), "slow")
+    # state 带了图但文字提示仍在（它知道有帧只是看不见）
+    assert "视锥画面" in prompt
+    payload = reflex._build_payload(_state_with_frame(), "slow", _config(vision=False))
+    user_msg = payload["messages"][1]
+    assert isinstance(user_msg["content"], str)
+    assert "base64" not in user_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_judge_sends_multimodal_request_when_frame_present():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return _content_response('"action":"quiet","think":false,"next_check_s":300,"reason":"r"}')
+
+    decision = await judge(
+        _state_with_frame(), _config(vision=True),
+        transport=httpx.MockTransport(handler),
+    )
+    assert decision["source"] == "reflex"
+    user_msg = seen["body"]["messages"][1]
+    assert isinstance(user_msg["content"], list)
+    assert user_msg["content"][1]["image_url"]["url"].endswith("base64,Q1JPUA==")
+
 
 
 # ── 预热（冷加载才是每拍回落的真凶）────────────────────────────────────

@@ -79,6 +79,9 @@ def _isolate_life_state(monkeypatch, tmp_path):
     # clock must never leak a current_time line into the next test's state.
     server_mod._REFLEX_TIME_STATE.clear()
     server_mod._REFLEX_TIME_STATE.update({"wanted": False, "asked_at": 0.0})
+    # Ambient eyes off by default: tests must opt in explicitly, otherwise
+    # every round would try to capture the real screen.
+    server_mod.set_screen_eyes(None)
     # Never let a built app's boot singleton (or a previous test's shadow)
     # decide whether this test's reflex gate is armed.
     server_mod._reflex_config_ref.pop("cfg", None)
@@ -263,13 +266,13 @@ def life(tmp_path, monkeypatch):
         server_mod._vitals_ref.pop("dir", None)
 
 
-def _arm(monkeypatch, judged: dict, *, max_tokens: int = 128) -> list[dict]:
+def _arm(monkeypatch, judged: dict, *, max_tokens: int = 128, vision: bool = False) -> list[dict]:
     """Arm the reflex layer with a scripted judge; returns the call log.
 
     The fake judge is the exact seam the wiring owns: it records the state
     dicts it was shown and replays ``judged`` verbatim, so dispatch can be
     tested without HTTP. The ReflexConfig is enabled and carries the given
-    max_tokens (the small-drain constant depends on it).
+    max_tokens (the small-drain constant depends on it) and vision flag.
     """
     calls: list[dict] = []
 
@@ -284,7 +287,7 @@ def _arm(monkeypatch, judged: dict, *, max_tokens: int = 128) -> list[dict]:
         ReflexConfig(
             url="http://127.0.1:1234/v1", model="lfm3-1.7b",
             api_key="lm-studio", prefill="{", max_tokens=max_tokens,
-            timeout_s=4.0, enabled=True,
+            timeout_s=4.0, enabled=True, vision=vision,
         )
     )
     return calls
@@ -857,6 +860,129 @@ def test_reflex_fallback_is_labelled_distinctly(life, monkeypatch, tmp_path):
     d_events = [e for e in brain_mod.snapshot() if e["type"] == "d_decision"]
     assert len(d_events) == 1
     assert d_events[0]["meta"]["source"] == "reflex·回落"
+
+
+# ── 12. 每轮视锥同帧：快直觉与主脑看同一张图 ─────────────────────────
+
+
+_FRAME_B64 = "Q1JPUA=="  # base64("CROP") — the fake cone crop
+
+
+@pytest.fixture
+def eyes(monkeypatch):
+    """Ambient eyes ON with a fake capture pipeline (no real screen)."""
+    server_mod.set_screen_eyes("always")
+    monkeypatch.setattr(server_mod, "screen_capture", lambda: "RlVMTA==")
+    monkeypatch.setattr(server_mod, "_pet_view_for_capture", _fake_pet_view)
+    monkeypatch.setattr(
+        server_mod, "crop_to_vision_cone", lambda *a, **k: _FRAME_B64
+    )
+    yield
+
+
+async def _fake_pet_view():
+    return {"pet": {"x": 0, "y": 0, "width": 100, "height": 100},
+            "facing": "right", "wa": {"width": 1920, "height": 1080}}
+
+
+def _image_urls(messages: list) -> list[str]:
+    urls = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                urls.append(part["image_url"]["url"])
+    return urls
+
+
+def test_same_frame_reaches_reflex_and_main_brain(eyes, life, monkeypatch, tmp_path):
+    """一轮一帧的硬约束：快直觉看的 b64 == 主脑消息里附的 b64。"""
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    calls = _arm(monkeypatch, {
+        "action": "speak", "think": False, "next_check_s": 120,
+        "reason": "画面里有东西", "source": "reflex",
+        "time_doing": "", "time_relevant": False, "time_note": "",
+    }, vision=True)
+    provider = _RecordingOpenAI([[
+        {"type": "delta", "content": "看到你了。"},
+        {"type": "end"},
+    ]])
+    _install(monkeypatch, provider, passive=_passive(action="quiet"))
+
+    frames = _run(provider, _req(messages=_PROACTIVE))
+
+    assert frames[-1]["event"] == "end"
+    assert len(provider.calls) == 1
+    # 快直觉看的那张：round frame 的锥形裁剪结果
+    assert calls[0]["state"]["image_b64"] == _FRAME_B64
+    assert calls[0]["state"]["frame_used_cone"] is True
+    # 主脑拿到的同一张：provider 消息里恰好一张图，b64 一模一样
+    urls = _image_urls(provider.calls[0]["messages"])
+    assert urls == [f"data:image/jpeg;base64,{_FRAME_B64}"]
+    # 遥测：采集 + 主脑送达各一次
+    assert telemetry_mod._instance.counters.get("round_frame.captured", 0.0) >= 1.0
+    assert telemetry_mod._instance.counters.get("round_frame.delivered_main", 0.0) >= 1.0
+
+
+def test_quiet_reflex_round_still_sees_the_frame(eyes, life, monkeypatch, tmp_path):
+    """安静轮：只有快直觉消费这一帧，主脑根本不跑。"""
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    calls = _arm(monkeypatch, {
+        "action": "quiet", "think": False, "next_check_s": 300,
+        "reason": "", "source": "reflex",
+        "time_doing": "", "time_relevant": False, "time_note": "",
+    }, vision=True)
+    provider = _RecordingOpenAI([[{"type": "delta", "content": "x"}, {"type": "end"}]])
+    _install(monkeypatch, provider, passive=_passive(action="quiet"))
+    frames = _run(provider, _req(messages=_PROACTIVE))
+    assert _events(frames) == [
+        "start", "tempo", "next_check_s", "quiet", "inner", "end",
+    ]
+    assert provider.calls == []
+    assert calls[0]["state"]["image_b64"] == _FRAME_B64
+
+
+def test_eyes_denied_no_frame_anywhere(life, monkeypatch, tmp_path):
+    """授权 deny：不采集、快直觉没有图、主脑消息里也没有图。"""
+    vitals, ledger = life
+    server_mod.set_screen_eyes(None)
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    calls = _arm(monkeypatch, {
+        "action": "speak", "think": False, "next_check_s": 120,
+        "reason": "", "source": "reflex",
+        "time_doing": "", "time_relevant": False, "time_note": "",
+    }, vision=True)
+    provider = _RecordingOpenAI([[
+        {"type": "delta", "content": "嗯。"}, {"type": "end"},
+    ]])
+    _install(monkeypatch, provider, passive=_passive(action="quiet"))
+    _run(provider, _req(messages=_PROACTIVE))
+    assert "image_b64" not in calls[0]["state"]
+    assert _image_urls(provider.calls[0]["messages"]) == []
+
+
+def test_text_only_reflex_config_ignores_frame(eyes, life, monkeypatch, tmp_path):
+    """config.vision=False（纯文本小模型）：快直觉不带图（不发给看不见的模型）。"""
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    calls = _arm(monkeypatch, {
+        "action": "quiet", "think": False, "next_check_s": 300,
+        "reason": "", "source": "reflex",
+        "time_doing": "", "time_relevant": False, "time_note": "",
+    }, vision=False)
+    provider = _RecordingOpenAI([[{"type": "delta", "content": "x"}, {"type": "end"}]])
+    _install(monkeypatch, provider, passive=_passive(action="quiet"))
+    _run(provider, _req(messages=_PROACTIVE))
+    assert calls[0]["state"]["image_b64"] == _FRAME_B64  # 帧在 state 里
+    assert calls[0]["config"].vision is False            # 但 config 说看不见
 
 
 # ── 11. Model-decided time sense: closed loop across ticks ──────────
