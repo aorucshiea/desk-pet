@@ -40,10 +40,12 @@ test("a stray <<<MEMEND>>> tag is never rendered as visible speech", () => {
   const renderer = read(RENDERER);
   const deps = [
     renderer.match(/const TOOL_STATUS_LINE_RE = .*;/),
+    renderer.match(/const TOOL_RESULT_LINE_RE = .*;/),
     renderer.match(/const TOOL_MARKER_LINE_RE = .*;/),
   ].map((m) => assert.ok(m, "tool-status regexes must exist") || m[0]).join("\n");
   const sanitize = loadFunction(RENDERER, "sanitizeReplyTags");
   const isStatusOnly = loadFunction(RENDERER, "isToolStatusOnlyReply", deps);
+  const stripStatus = loadFunction(RENDERER, "stripToolStatusLines", deps);
 
   assert.equal(sanitize("<<<MEMEND>>>"), "");
   assert.equal(sanitize("正文<<<memend>>>"), "正文");
@@ -55,6 +57,12 @@ test("a stray <<<MEMEND>>> tag is never rendered as visible speech", () => {
   );
   // A tag-only round carries no answer, so it cannot look like speech.
   assert.equal(isStatusOnly("<<<MEMEND>>>"), false);
+
+  // Tool outcome lines are visible live but never part of the answer.
+  assert.equal(stripStatus("_执行 memory..._\n_✓ memory 完成_\n正文"), "正文");
+  assert.equal(stripStatus("_✗ pet_turn_head 失败：window gone_\n正文"), "正文");
+  assert.equal(isStatusOnly("_执行 memory..._\n_✓ memory 完成_"), true);
+  assert.equal(isStatusOnly("_✗ memory 失败：boom_"), true);
 });
 
 test("the chat prompt no longer names the retired MEMORY.md / USER.md surfaces", () => {

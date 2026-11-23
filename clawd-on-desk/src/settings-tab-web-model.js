@@ -358,6 +358,12 @@
     });
     actions.appendChild(startButton);
     actions.appendChild(testButton);
+    actions.appendChild(softBtn("重置网页会话", async () => {
+      const result = await window.petSettings.webModelResetSession();
+      if (result.status !== "ok") toast(result.message || "重置失败", true);
+      else toast("下一次请求会新建网页会话，并重新投入完整提示词");
+      await refresh();
+    }));
     actions.appendChild(selectButton);
     actions.appendChild(copyButton);
     actions.appendChild(softBtn("打开 DeepSeek", async () => {

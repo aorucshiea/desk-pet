@@ -150,6 +150,7 @@ const createThemeRuntime = require("./theme-runtime");
 const createAgentRuntimeMain = require("./agent-runtime-main");
 const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
+const { createVirtualDesktopGuard } = require("./virtual-desktop-guard");
 const createMacHideController = require("./mac-hide");
 const { createHardwareBuddyAdapter } = require("./hardware-buddy-adapter");
 const {
@@ -921,6 +922,43 @@ function togglePetVisibility() {
   prepManualPetVisibility();
   return petWindowRuntime.togglePetVisibility();
 }
+
+// The pet windows are topmost transparent overlays that Windows does not
+// track per virtual desktop. Bind the pet to the desktop where it launched:
+// hide it when the watcher reports another desktop, show it again on return.
+let virtualDesktopGuard = null;
+let virtualDesktopBoundIndex = null;
+let virtualDesktopHiddenByGuard = false;
+
+function startVirtualDesktopGuard() {
+  if (process.platform !== "win32" || virtualDesktopGuard) return;
+  virtualDesktopGuard = createVirtualDesktopGuard({
+    onDesktopChange(index) {
+      if (virtualDesktopBoundIndex === null) {
+        virtualDesktopBoundIndex = index;
+        return;
+      }
+      if (index === virtualDesktopBoundIndex) {
+        if (virtualDesktopHiddenByGuard) {
+          virtualDesktopHiddenByGuard = false;
+          petWindowRuntime.setPetHidden(false);
+        }
+        return;
+      }
+      if (virtualDesktopHiddenByGuard) return;
+      const result = petWindowRuntime.setPetHidden(true);
+      // Only remember a hide we actually caused; a pet already hidden by the
+      // user must stay hidden when they come back to this desktop.
+      if (result && result.applied && result.changed) {
+        virtualDesktopHiddenByGuard = true;
+      }
+    },
+    onError(err) {
+      console.warn("Clawd: virtual desktop guard unavailable:", err && err.message);
+    },
+  });
+  virtualDesktopGuard.start();
+}
 function bringPetToPrimaryDisplay() {
   prepManualPetVisibility();
   return petWindowRuntime.bringPetToPrimaryDisplay();
@@ -1166,41 +1204,91 @@ function moveWindowForDrag() { return petWindowRuntime.moveWindowForDrag(); }
 // the work area; plays the drag reaction while walking. [WALK_DESKTOP]
 // is not ported on the Electron shell yet (virtual-desktop COM lives in
 // the Tauri rewrite) — the message is swallowed gracefully.
-let _petWalkBusy = false;
-ipcMain.on("pet:pet-walk", (_event, { dx, dy } = {}) => {
-  try {
-    if (_petWalkBusy) return;
-    // 视锥用：模型自己走的方向就是它的朝向。
-    if (Number(dx) > 0) petFacing = "right";
-    else if (Number(dx) < 0) petFacing = "left";
-    const startBounds = getPetWindowBounds();
-    const wa = getNearestWorkArea(
-      startBounds.x + startBounds.width / 2,
-      startBounds.y + startBounds.height / 2,
-    );
-    const targetX = Math.max(wa.x, Math.min(wa.x + wa.width - startBounds.width, startBounds.x + (Number(dx) || 0)));
-    const targetY = Math.max(wa.y, Math.min(wa.y + wa.height - startBounds.height, startBounds.y + (Number(dy) || 0)));
-    const totalX = targetX - startBounds.x;
-    const totalY = targetY - startBounds.y;
-    const steps = Math.max(1, Math.min(60, Math.round((Math.abs(totalX) + Math.abs(totalY)) / 24)));
-    _petWalkBusy = true;
-    let step = 0;
-    const walkTimer = setInterval(() => {
-      step += 1;
-      const f = step / steps;
-      applyPetWindowBounds({
-        x: Math.round(startBounds.x + totalX * f),
-        y: Math.round(startBounds.y + totalY * f),
-        width: startBounds.width,
-        height: startBounds.height,
+const _petActions = [];
+let _petActionActive = null;
+function failPetAction(message) {
+  return { status: "error", applied: false, message: String(message) };
+}
+function processPetAction() {
+  if (_petActionActive) return;
+  const item = _petActions.shift();
+  if (!item) return;
+  _petActionActive = item;
+  let timer = null;
+  const finish = (result) => {
+    if (timer) clearInterval(timer);
+    if (_petActionActive !== item) return;
+    _petActionActive = null;
+    item.resolve(result);
+    processPetAction();
+  };
+  if (petWindowRuntime.isDragLocked() || _mini.getIsAnimating() || _mini.getIsTransitioning()) {
+    finish(failPetAction("body is moving with the user"));
+    return;
+  }
+  if (item.kind === "turn") {
+    try {
+      if (!win || win.isDestroyed()) { finish(failPetAction("window gone")); return; }
+      petFacing = item.direction;
+      setForceEyeResend(true);
+      finish({ status: "ok", applied: true, kind: "turn", facing: petFacing });
+    } catch (err) { finish(failPetAction(err && err.message || err)); }
+    return;
+  }
+  if (!win || win.isDestroyed()) { finish(failPetAction("window gone")); return; }
+  const start = win.getBounds();
+  if (Number(item.dx) > 0) petFacing = "right";
+  else if (Number(item.dx) < 0) petFacing = "left";
+  const wa = getNearestWorkArea(start.x + start.width / 2, start.y + start.height / 2);
+  const targetX = Math.max(wa.x, Math.min(wa.x + wa.width - start.width, start.x + item.dx));
+  const targetY = Math.max(wa.y, Math.min(wa.y + wa.height - start.height, start.y + item.dy));
+  const steps = Math.max(1, Math.min(60, Math.round((Math.abs(targetX - start.x) + Math.abs(targetY - start.y)) / 24)));
+  let step = 0;
+  timer = setInterval(() => {
+    if (!win || win.isDestroyed()) { finish(failPetAction("window gone")); return; }
+    if (petWindowRuntime.isDragLocked() || _mini.getIsAnimating() || _mini.getIsTransitioning()) {
+      finish(failPetAction("body is moving with the user"));
+      return;
+    }
+    step += 1;
+    const f = step / steps;
+    applyPetWindowBounds({
+      x: Math.round(start.x + (targetX - start.x) * f),
+      y: Math.round(start.y + (targetY - start.y) * f),
+      width: start.width,
+      height: start.height,
+    });
+    if (step >= steps) {
+      const bounds = win.getBounds();
+      finish({
+        status: "ok", applied: true, kind: "walk",
+        x: bounds.x, y: bounds.y, facing: petFacing,
+        bounds: { left: bounds.x, top: bounds.y, right: bounds.x + bounds.width, bottom: bounds.y + bounds.height },
       });
-      if (step >= steps) {
-        clearInterval(walkTimer);
-        _petWalkBusy = false;
-      }
-    }, 28);
-  } catch {}
-});
+    }
+  }, 28);
+}
+function actPet(action) {
+  if (action.kind === "turn") {
+    if (action.direction !== "left" && action.direction !== "right") return Promise.resolve(failPetAction("direction must be left or right"));
+  } else if (action.kind !== "walk") {
+    return Promise.resolve(failPetAction("unsupported action"));
+  } else if (!Number.isFinite(action.dx) || !Number.isFinite(action.dy)) {
+    return Promise.resolve(failPetAction("walk requires finite dx and dy"));
+  }
+  if (_petActions.length >= 64) return Promise.resolve(failPetAction("body action queue is full"));
+  return new Promise((resolve) => {
+    _petActions.push({ kind: action.kind, dx: action.dx, dy: action.dy, direction: action.direction, resolve });
+    processPetAction();
+  });
+}
+function disposePetActions() {
+  for (const item of _petActions.splice(0)) item.resolve(failPetAction("app is closing"));
+  if (_petActionActive) _petActionActive.resolve(failPetAction("app is closing"));
+  _petActionActive = null;
+}
+ipcMain.on("pet:pet-walk", (_event, { dx, dy } = {}) => { void actPet({ kind: "walk", dx, dy }); });
+ipcMain.on("pet:pet-turn", (_event, { direction } = {}) => { void actPet({ kind: "turn", direction }); });
 ipcMain.on("pet:pet-hop-desktop", () => {
   // not ported on the Electron shell — swallowed so the tag never errors
 });
@@ -1720,39 +1808,7 @@ const _serverCtx = {
   getPetBounds: () => (win && !win.isDestroyed() ? win.getBounds() : null),
   // 工作区（DIP）——网关用它判断"刚体顶边是否在屏幕外"（最大化窗户站不上去）
   getWorkArea: () => screen.getPrimaryDisplay().workArea,
-  // AI 自主移动（决策层 /pet/walk）：dx, dy 像素增量，clamp 在工作区内
-  walkPet: (dx, dy) => {
-    try {
-      if (!win || win.isDestroyed()) return { status: "error", message: "window gone" };
-      if (dx > 0) petFacing = "right";
-      else if (dx < 0) petFacing = "left";
-      const b = win.getBounds();
-      const wa = screen.getPrimaryDisplay().workArea;
-      const nextX = Math.max(wa.x, Math.min(wa.x + wa.width - b.width, b.x + dx));
-      const nextY = Math.max(wa.y, Math.min(wa.y + wa.height - b.height, b.y + dy));
-      // 步进行走而非瞬移——站上高窗顶时瞬移看起来像"飞"（实测反馈）。
-      // 与 pet:pet-walk 同一套步进节奏；回复的是终点（ HTTP 调用方要的是
-      // 位置事实，动画在后台 ~1s 内完成）。
-      const totalX = nextX - b.x;
-      const totalY = nextY - b.y;
-      const steps = Math.max(1, Math.min(60, Math.round((Math.abs(totalX) + Math.abs(totalY)) / 24)));
-      let step = 0;
-      const walkTimer = setInterval(() => {
-        step += 1;
-        const f = step / steps;
-        try {
-          petWindowRuntime.applyPetWindowPosition(
-            Math.round(b.x + totalX * f),
-            Math.round(b.y + totalY * f),
-          );
-        } catch (_) {}
-        if (step >= steps) clearInterval(walkTimer);
-      }, 28);
-      return { status: "ok", x: Math.round(nextX), y: Math.round(nextY) };
-    } catch (err) {
-      return { status: "error", message: (err && err.message) || String(err) };
-    }
-  },
+  actPet: (action) => actPet(action),
 };
 const _server = require("./server")(_serverCtx);
 const { startHttpServer, getHookServerPort } = _server;
@@ -3256,6 +3312,7 @@ function createWindow() {
   win.on("resize", () => petWindowRuntime.syncFloatingWindowsAfterPetBoundsChange());
 
   syncSessionHudVisibility();
+  startVirtualDesktopGuard();
 
   ipcMain.removeAllListeners("open-pet-chat");
   ipcMain.on("open-pet-chat", () => {
@@ -3761,6 +3818,11 @@ if (!gotTheLock) {
 
   app.on("before-quit", () => {
     isQuitting = true;
+    disposePetActions();
+    if (virtualDesktopGuard) {
+      virtualDesktopGuard.stop();
+      virtualDesktopGuard = null;
+    }
     releasePowerSaveBlocker();
     flushRuntimeStateToPrefs();
     globalShortcut.unregisterAll();

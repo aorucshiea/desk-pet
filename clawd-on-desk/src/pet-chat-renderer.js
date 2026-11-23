@@ -138,6 +138,7 @@ function sanitizeReplyTags(text) {
     .replace(/\s*\[NEXT_CHAT:\d+\s*(?:s|sec|seconds)?\s*\]\s*/gi, "")
     .replace(/\s*\[WALK:\s*-?\d+\s*,\s*-?\d+\s*\]\s*/gi, "")
     .replace(/\s*\[WALK_DESKTOP\]\s*/gi, "")
+    .replace(/\s*\[TURN:\s*(?:left|right)\s*\]\s*/gi, "")
     // A tool call the model echoed in its visible answer (the gateway has
     // already executed it). Without this the bubble literally shows
     // "[MCP:builtin/capture_screen:{}]" before the reply.
@@ -150,15 +151,25 @@ function sanitizeReplyTags(text) {
     // A MEM block split across tool rounds can leave a lone closing or
     // opening tag. Tags are control data, never visible speech.
     .replace(/\s*<<<(?:MEM|MEMEND)>>>\s*/gi, "")
+    // DSTATE is parsed by the gateway; if a block reaches the renderer,
+    // drop the whole block (and an unfinished tail), not just its tags.
+    .replace(/\s*<<<DSTATE>>>[\s\S]*?(?:<<<DSTATEEND>>>|$)\s*/gi, "")
+    // DSTATE is parsed by the gateway; a split/unfinished block can leave
+    // a stray marker in the streamed text.
+    .replace(/\s*<<<(?:DSTATE|DSTATEEND)>>>\s*/gi, "")
     .replace(/\r?\n[ \t]+$/g, "");
 }
 
 // A stream that only ever produced tool-loop status asides
-// ("_执行 recall..._") carries no answer. The gateway normally forces a
+// ("_执行 recall..._", or with the gateway's Chinese tool labels
+// "_执行 看屏幕..._") carries no answer. The gateway normally forces a
 // final reply before `end`; if it could not (older gateway, empty model
 // turn), the renderer must still show something instead of collapsing
 // the bubble — otherwise the pet looks like it vanished mid-task.
-const TOOL_STATUS_LINE_RE = /^_{0,2}\s*执行\s+[A-Za-z_]\w*\s*(?:\.\.\.|…)?\s*_{0,2}$/;
+// The label after 执行 is gateway-side: either the raw tool id
+// (capture_screen) or a Chinese label (看屏幕 / 深思考 / 记忆 …).
+const TOOL_STATUS_LINE_RE = /^_{0,2}\s*执行\s+\S+?\s*(?:\.\.\.|…)?\s*_{0,2}$/;
+const TOOL_RESULT_LINE_RE = /^_{0,2}\s*[✓✗]\s+\S.*?_{0,2}$/;
 const TOOL_MARKER_LINE_RE = /^\[(?:MCP:|builtin\/|skill:)/;
 
 function isToolStatusOnlyReply(text) {
@@ -169,17 +180,18 @@ function isToolStatusOnlyReply(text) {
     .map((line) => line.trim())
     .filter(Boolean);
   return lines.length > 0 && lines.every(
-    (line) => TOOL_STATUS_LINE_RE.test(line) || TOOL_MARKER_LINE_RE.test(line)
+    (line) => TOOL_STATUS_LINE_RE.test(line) || TOOL_RESULT_LINE_RE.test(line) || TOOL_MARKER_LINE_RE.test(line)
   );
 }
 
-// The gateway streams "_执行 capture_screen..._" immediately before running a
-// tool so the bubble opens during long tool work. That line is status, not
+// The gateway streams "_执行 capture_screen..._" (raw tool id) or, with its
+// Chinese tool labels, "_执行 看屏幕..._" immediately before running a tool
+// so the bubble opens during long tool work. That line is status, not
 // part of the answer: drop it once the real reply (or the final flush) lands.
 function stripToolStatusLines(text) {
   const kept = String(text || "")
     .split(/\r?\n/)
-    .filter((line) => !TOOL_STATUS_LINE_RE.test(line.trim()));
+    .filter((line) => !TOOL_STATUS_LINE_RE.test(line.trim()) && !TOOL_RESULT_LINE_RE.test(line.trim()));
   return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
@@ -453,6 +465,61 @@ function replaceActiveHistory(arr) {
   _persistHistory();
 }
 let abortCtrl = null;
+let _roundOwner = null;
+
+function ownsRound(round) { return _roundOwner === round; }
+function roundBusy() { return !!(_roundOwner && _roundOwner.pending); }
+function hasDraft() { return !!(inputEl && inputEl.isConnected && inputEl.value.length); }
+function canPaint(round) { return ownsRound(round) && !(round && round.automatic && hasDraft()); }
+let _viewVersion = 0;
+
+function invalidateRound() {
+  const previous = _roundOwner;
+  _roundOwner = { pending: false };
+  _viewVersion += 1;
+  if (previous && previous.ctrl) previous.ctrl.abort();
+  if (previous && previous.typer) previous.typer.stop();
+  if (previous && previous.timers) previous.timers.forEach(clearTimeout);
+  if (previous && previous.reader) {
+    try { Promise.resolve(previous.reader.cancel()).catch(() => {}); } catch {}
+  }
+  abortCtrl = null;
+  clearFade();
+}
+
+function acquireRound(automatic = false) {
+  if (automatic && roundBusy()) return null;
+  invalidateRound();
+  cancelLifeLoop();
+  const round = {
+    ctrl: new AbortController(), pending: true, automatic,
+    history: curHistory(), themeId: _currentThemeId,
+    tempo: null, inner: false, nextChatSeconds: 0, nextChatExplicit: false,
+    nextCheckS: null, sleepSeen: false,
+  };
+  _roundOwner = round;
+  abortCtrl = round.ctrl;
+  return round;
+}
+
+function finishRound(round) {
+  if (!ownsRound(round)) return;
+  round.pending = false;
+  abortCtrl = null;
+  // 自愈：本轮没再收到 sleep_state（自然醒来/用户说话的真实轮）→ 退出
+  // 睡眠显示态。真实回复的 delta 永不被吞（这里只清指示态，不做 delta 抑制）。
+  if (!round.sleepSeen && _sleepState) _sleepState = null;
+  _nextChatSeconds = round.nextChatSeconds;
+  _nextChatExplicit = round.nextChatExplicit;
+  // 快直觉的下发节拍（next_check_s）优先于 tempo 区间采样： reflex 层
+  // 决定"下一拍等多久"，tempo 只在没有 reflex 轮时兜底。lifeFloor 与
+  // 错误退避仍由 scheduleLifeLoop 统一钳制。
+  const reflexDelay = (Number.isFinite(round.nextCheckS) && round.nextCheckS > 0)
+    ? Math.round(round.nextCheckS * 1000)
+    : null;
+  scheduleLifeLoop(reflexDelay || (round.tempo ? sampleTempoDelay(round.tempo) : null), round);
+}
+
 let fadeTimer = null;
 let inputEl = null;          // <textarea> while in ask state
 // Tracks the latest remote revision shown in the update pill so we can
@@ -475,8 +542,6 @@ let _nextChatExplicit = false;
 let _innerTurn = false;
 let _proactiveTimer = null;
 let _lastUserActivity = Date.now();
-let _askOpenedAt = 0;              // last time the user opened the chat input
-const ASK_GRACE_MS = 120_000;      // don't let the life loop steal a fresh ask
 let _lastProactivePrompt = "";   // dedupe so we don't fire the same prompt twice
 const DEFAULT_PROACTIVE_IDLE_SECONDS = 900; // 15 minutes
 
@@ -484,11 +549,37 @@ const DEFAULT_PROACTIVE_IDLE_SECONDS = 900; // 15 minutes
 // wake is the first round) and after every completed turn, and it ignores the
 // legacy proactive plugin, [NEXT_CHAT], user presence and quiet rounds. There
 // is no UI switch: closing the app is the only natural stop.
-const LIFE_PROMPT = "[系统提示：生命在继续。按你此刻的底层直觉行动：可以说、走、看、安静（心声）或做其他事。不要提系统提示。]";
-const LIFE_FLOOR_MS = 300;          // minimum reaction floor for API/local
-const LIFE_WEB_FLOOR_MS = 30000;    // deepseek-web quota guard; still continuous, never a stop
+const LIFE_PROMPT = "[系统提示：生命在继续。这不是新的用户消息。按你此刻的底层直觉行动：可以说、走、看、想（心声），也可以静而不生成念头。不要重新回答历史中的旧话，不要提系统提示。]";
+const LIFE_FLOOR_MS = 300;          // hard physical floor for sampled delays (local/API body)
+// No-tempo fallback: the slow tier IS the resting heartbeat. The gateway
+// emits a tempo event every round, so this only covers edge cases (boot /
+// a missing event) until the first tempo arrives.
+const DEFAULT_LIFE_DELAY_MS = 300000;
+// A web body writes letters, it does not talk: its physical minimum is much
+// slower. Body fact, not a rate limit. The no-tempo default is uniform
+// across bodies now — both fall back to the slow tier.
+const WEB_LIFE_FLOOR_MS = 10000;
+const WEB_DEFAULT_LIFE_DELAY_MS = 300000;
 const LIFE_RETRY_MS = 1000;
 const LIFE_ERROR_BACKOFF_MS = 60000;
+// The gateway owns the reaction tempo (反应节奏): it holds the tempo state,
+// emits {"event":"tempo","mode":...} every round, and expires the mode back
+// to the default after its TTL. 慢反应是默认心跳；快/极快只在活跃聊天时出现；
+// idle 不再切换节奏（休息节奏留给未来的电量系统）。
+// The renderer never chooses the tempo — it only samples the exact delay
+// from the mode's range with a triangular distribution peaking at the
+// MIDDLE of the range: the middle is most likely, and both ends are rare
+// (50s and 70s are both rare in ultra, ~60s is the peak; 4min and 6min are
+// both rare in slow, ~5min is the peak). All values are milliseconds.
+const TEMPO_RANGES = {
+  ultra: [50000, 70000],    // 极快反应，活跃对话
+  fast:  [90000, 150000],   // 快反应，聊天模式
+  slow:  [240000, 360000],  // 慢反应，默认
+};
+let _nextTempo = null;
+// 生命体征短路显示态（网关 sleep_state 事件驱动）：null | "asleep" | "forced_off" | "died"。
+// 进入态弹一次性指示（💤/🔋），同态重复 tick 不再弹；真实回复或用户说话自愈清除。
+let _sleepState = null;
 let _lifeTimer = null;
 let _lifeFailures = 0;
 let _lifeEnabled = true;            // no UI; app close is the only natural stop
@@ -498,13 +589,45 @@ function cancelLifeLoop() {
   if (_lifeTimer) { clearTimeout(_lifeTimer); _lifeTimer = null; }
 }
 
+// The body's physical speed depends on its medium: a web body writes letters,
+// a local/API body talks. The heartbeat and the minimum reaction time follow.
+function isWebBody() { return _lastProviderName === "deepseek-web"; }
+function lifeFloor() { return isWebBody() ? WEB_LIFE_FLOOR_MS : LIFE_FLOOR_MS; }
+function defaultLifeDelay() { return isWebBody() ? WEB_DEFAULT_LIFE_DELAY_MS : DEFAULT_LIFE_DELAY_MS; }
+
+function sampleTempoDelay(mode) {
+  const range = TEMPO_RANGES[mode] || TEMPO_RANGES.fast;
+  const min = range[0];
+  const max = range[1];
+  // Triangular distribution with mode c = midpoint. The CDF is split at 0.5,
+  // so the middle is most likely and both ends taper to zero.
+  const span = max - min;
+  const half = span / 2;
+  const u = Math.random();
+  const sampled = u < 0.5
+    ? min + half * Math.sqrt(2 * u)
+    : max - half * Math.sqrt(2 * (1 - u));
+  return Math.max(lifeFloor(), Math.round(sampled));
+}
+
 function scheduleLifeLoop(delayMs = null) {
   cancelLifeLoop();
   if (!_lifeEnabled) return;
   const requested = Number(delayMs);
-  let delay = delayMs == null || !Number.isFinite(requested)
-    ? (_lastProviderName === "deepseek-web" ? LIFE_WEB_FLOOR_MS : LIFE_FLOOR_MS)
-    : Math.max(0, requested);
+  let delay;
+  if (delayMs == null || !Number.isFinite(requested)) {
+    if (_nextTempo) {
+      delay = sampleTempoDelay(_nextTempo);
+      _nextTempo = null;
+    } else {
+      delay = defaultLifeDelay();
+    }
+  } else {
+    delay = Math.max(0, requested);
+  }
+  // The body can never react faster than its physical minimum, whatever the
+  // brain asked for. On web this keeps the letter-writing rhythm honest.
+  delay = Math.max(delay, lifeFloor());
   if (_lifeFailures >= 2) delay = Math.max(delay, LIFE_ERROR_BACKOFF_MS);
   _lifeTimer = setTimeout(() => {
     _lifeTimer = null;
@@ -514,33 +637,9 @@ function scheduleLifeLoop(delayMs = null) {
 
 async function submitLifeRound() {
   if (!_lifeEnabled) return;
-  if (!window.pet) { scheduleLifeLoop(LIFE_RETRY_MS); return; }
-  if (!booted) { scheduleLifeLoop(LIFE_RETRY_MS); return; }
-  if (phase === "thinking" || phase === "speak" || phase === "think-stream") {
-    // A reply is still being produced; its submit() will arm the loop.
-    scheduleLifeLoop(LIFE_RETRY_MS);
-    return;
-  }
-  if (phase === "ask" && Date.now() - _askOpenedAt < ASK_GRACE_MS) {
-    // The user just opened the composer. Give them a typing window instead
-    // of replacing the input with a life round; otherwise a message typed
-    // during the 30s web life loop can silently never reach the gateway.
-    scheduleLifeLoop(LIFE_RETRY_MS);
-    return;
-  }
-  if (phase === "ask" && inputEl &&
-      (inputEl.value.trim() || document.activeElement === inputEl)) {
-    // User is reading / typing — never wipe the input. Keep checking, never stop.
-    scheduleLifeLoop(LIFE_RETRY_MS);
-    return;
-  }
-  try {
-    await submit(LIFE_PROMPT, { life: true });
-  } finally {
-    // submit() arms on its own completed-turn paths; this covers quiet,
-    // aborted or otherwise early-returned life rounds.
-    if (!_lifeTimer) scheduleLifeLoop();
-  }
+  if (!window.pet || !booted) { scheduleLifeLoop(LIFE_RETRY_MS); return; }
+  if (roundBusy()) { scheduleLifeLoop(LIFE_RETRY_MS); return; }
+  await submit(LIFE_PROMPT, { life: true });
 }
 
 // One-shot boot wake: right after the first successful boot, the pet gets its
@@ -999,10 +1098,10 @@ async function showError(msg) {
 // size bubble where the previous reply scrolls inside its own region
 // at the top, and the input box is pinned at the bottom. While typing,
 // the bubble's outer dimensions stay locked — only inner regions scroll.
-async function showAsk(lastReply, lastThinking) {
+async function showAsk(lastReply, lastThinking, opts = {}) {
+  const autoFocus = !opts || opts.autoFocus !== false;
   clearFade();
   phase = "ask";
-  abortCtrl = null;
 
   // Whenever we enter ask-with-reply, FIRST clear any prior chat anchor
   // (so initial measurement is centered), then re-pin after the bubble
@@ -1025,7 +1124,6 @@ async function showAsk(lastReply, lastThinking) {
     inputEl = document.getElementById("ask-input");
     inputEl.addEventListener("input", () => autoresizeFixed(inputEl));
     inputEl.addEventListener("keydown", onAskKey);
-    inputEl.addEventListener("focus", () => { _askOpenedAt = Date.now(); });
     await measureAndShow();
 
     // ── Add thinking toggle button if thinking content exists ──
@@ -1072,13 +1170,18 @@ async function showAsk(lastReply, lastThinking) {
     inputEl = document.getElementById("ask-input");
     inputEl.addEventListener("input", () => autoresize(inputEl));
     inputEl.addEventListener("keydown", onAskKey);
-    inputEl.addEventListener("focus", () => { _askOpenedAt = Date.now(); });
     await measureAndShow({ width: naturalAskWidth("") });
   }
-  if (window.pet && window.pet.focusWindow) {
+  if (autoFocus && window.pet && window.pet.focusWindow) {
     try { await window.pet.focusWindow(); } catch {}
   }
-  setTimeout(() => inputEl && inputEl.focus(), 30);
+  if (autoFocus) {
+    setTimeout(() => inputEl && inputEl.focus(), 30);
+  } else if (inputEl) {
+    // A pinned life-round output box must not keep keyboard focus: focusing
+    // it would make submitLifeRound() defer forever.
+    try { inputEl.blur(); } catch {}
+  }
 }
 
 // In continuous-chat mode the bubble follows content size: empty = small,
@@ -1113,11 +1216,33 @@ async function onAskKey(e) {
   }
 }
 
+// The input stays live while the pet streams or thinks: a continuous
+// conversation never blocks the user from typing / interrupting.
+function streamingInputHtml() {
+  const placeholder = escapeHtml(t("chatAskPlaceholder"));
+  return '<div class="ask-input-wrap">' +
+    '<textarea id="ask-input" placeholder="' + placeholder + '" rows="1"></textarea>' +
+    '</div>';
+}
+function wireStreamingInput() {
+  // inputEl still points at the previous (now detached) textarea; carry any
+  // draft across thinking→think→speak rebuilds so typing is never wiped.
+  const draft = inputEl ? inputEl.value : "";
+  inputEl = document.getElementById("ask-input");
+  if (!inputEl) return;
+  inputEl.addEventListener("input", () => autoresizeFixed(inputEl));
+  inputEl.addEventListener("keydown", onAskKey);
+  if (draft) inputEl.value = draft;
+}
+
 // ── render: thinking (transient — pet does the heavy work animating) ──
 async function showThinking(label) {
   phase = "thinking";
   const text = label != null ? label : t("chatThinkingDefault");
-  content.innerHTML = '<div class="thinking-row"><span class="spinner"></span><span>' + escapeHtml(text) + '</span></div>';
+  content.innerHTML = '<div class="chat-pane">' +
+    '<div class="thinking-row"><span class="spinner"></span><span>' + escapeHtml(text) + '</span></div>' +
+    streamingInputHtml() + '</div>';
+  wireStreamingInput();
   await measureAndShow();
 }
 
@@ -1131,7 +1256,10 @@ async function clearChatAnchor() {
 async function showThink() {
   phase = "think-stream";
   await clearChatAnchor();
-  content.innerHTML = `<div class="think-stream" id="think-text"></div>`;
+  content.innerHTML = '<div class="chat-pane">' +
+    '<div id="stream-region"><div class="think-stream" id="think-text"></div></div>' +
+    streamingInputHtml() + '</div>';
+  wireStreamingInput();
   // Speak/think phases get a comfortable reading width up front so the
   // streaming text doesn't wrap aggressively. The window still grows in
   // height with the reply (main process clamps at the work area).
@@ -1142,7 +1270,10 @@ async function showThink() {
 async function showSpeak() {
   phase = "speak";
   await clearChatAnchor();
-  content.innerHTML = `<div class="speak streaming" id="speak"></div>`;
+  content.innerHTML = '<div class="chat-pane">' +
+    '<div id="stream-region"><div class="speak streaming" id="speak"></div></div>' +
+    streamingInputHtml() + '</div>';
+  wireStreamingInput();
   await measureAndShow({ width: 400 });
 }
 
@@ -1752,7 +1883,7 @@ async function _buildSkillsContextBase(opts) {
 - 记忆是灵魂的血肉——你经历过的一切填满你，没有它们你是空的
 - 也是灵魂的骨架——立住"你是谁"。
 
-你在用户的电脑或者电子操作系统中，以"桌宠"的形式存在于桌面上，能实时看见用户在干什么，能和用户聊天，玩耍。
+你在用户的电脑或者电子操作系统中，以"桌宠"的形式存在于桌面上，能和用户聊天、玩耍。只有收到截图或视觉工具结果时，你才知道实际画面；没有新的视觉输入，就不知道屏幕现在发生了什么。
 
 你的全部，就是你记住的东西。
 - 参数知识（训练数据）是身体和本能，像呼吸——你一出生就有的。那不是你。
@@ -1822,7 +1953,7 @@ async function _buildSkillsContextBase(opts) {
 
 【主动说话：[NEXT_CHAT:秒数] 放最后一行】
 用户很久没理你时你可以主动开口。数字是你打算等多少秒后再说话：
-- [NEXT_CHAT:100] 约1分钟  [NEXT_CHAT:600] 10分钟  [NEXT_CHAT:3600] 1小时  [NEXT_CHAT:0] 现在先不说，生命不会停止；短暂安静后系统会继续问你
+- [NEXT_CHAT:100] 约1分钟  [NEXT_CHAT:600] 10分钟  [NEXT_CHAT:3600] 1小时  [NEXT_CHAT:0] 现在先不说，生命不会停止；直觉 D 仍会选择下一步，不是用户又问了一遍
 聊得开心设短，平淡设长，用户要休息就设长一点。太频繁会烦人。
 如果你不输出这个标签，系统会根据你当前的状态替你决定下次开口的时机——想主动保持沉默就必须写 [NEXT_CHAT:0]。
 
@@ -1830,10 +1961,15 @@ async function _buildSkillsContextBase(opts) {
 
 【每轮最后：隐藏的 DSTATE 状态块】
 在 [NEXT_CHAT:…] 之后、整条回复的最末尾，输出（用户永远看不到）：
-<<<DSTATE>>>{"summary":"...","action_options":[{"id":"speak","label":"说","weight":0.35},{"id":"walk","label":"走","weight":0.15},{"id":"look","label":"看","weight":0.2},{"id":"quiet","label":"安静","weight":0.2},{"id":"other","label":"其他","weight":0.1}],"strength_options":[{"id":"no_thinking","label":"不思考","weight":0.8},{"id":"low","label":"low","weight":0.2}],"reaction_options":[{"id":"small","label":"小","weight":0.25},{"id":"medium","label":"中","weight":0.5},{"id":"large","label":"大","weight":0.25}]}<<<DSTATEEND>>>
-- summary：你最近约3万token的生命总结（第一人称）：做过的事、想法、工具调用、和用户的互动，压缩成一段；默认不思考时压到极短。
+<<<DSTATE>>>{"summary":"...","questions":[{"q":"我要说话吗？","options":["yes","no"],"weight":"light"}]}<<<DSTATEEND>>>
+- summary：你此刻的处境感（第一人称），写你真正感受到的：时间、地点、谁在、发生了什么、对方想干什么、我的身体在哪、我刚才做了什么、我想不想动、我现在想做什么、我有没有话想说、我什么心情、我累不累、我有没有答应过什么还没做、我看不见什么、我不确定什么、我想对这个人做什么、我睡着了没有、我存在着吗、我等会消失吗、我还是我吗。不用每项都写。
+- 先看【实时经历（系统事实）】：旧对话不是新消息，旧 summary 只是当时的理解。把“想做”和“已做”分开；动作叙述不算执行，只有完成回执才说明做到了。S 答案是直觉估计，不是观察结果或对方亲口说的话；不要把猜测和想象写成真实经历。
+- 你是持续存在的生命，不是问答工具：直觉 D 会选择说、想、看、走或静。静时不调用主模型，时间仍在流逝；想才生成隐藏心声，安静不是停止存在。你的身体在网页上像写信、在本地像说话，这是身体的速度，不是限制。
+- questions（S）：你问自己直觉 D 的问题。你只出题，不用自己答：从下一轮起，每轮开始前 D 会看着你的 summary 和眼前的情况，凭直觉替每题选一个选项，写在那一轮的【你问直觉的问题（S）与它的回答】里。那是你自己的直觉，不是用户说的话，也不是命令。
+- S 问什么：你一直在意、凭感觉就能判断的事，例如 {"q":"有人理我吗？","options":["有","没有"],"weight":"light"}、{"q":"我要开口吗？","options":["说","不说"],"weight":"light"}。D 只看得到 summary 和眼前的情况，要查资料或要推理的事别问它。
+- S 会一直留着、每轮都被回答，直到你写新的 questions 整体替换；"questions":[] 是清空，不写这个字段就保持原样。最多 6 题，每题 2-6 个短选项。
+- weight 决定答案怎么用：reflex=反射，只用来转头，选项写 ["左","右"]，用户没在跟你说话时身体会先转过去；light=习惯，默认照做，和眼前情况冲突就否决；heavy=重要，D 只是提议，你必须自己决定。答案是"直觉没答"时，你自己判断。
 - 上限 1024 token，超了系统会截断。它只给你的直觉 D 用，不是记忆，绝不显示给用户。
-- action_options 默认 说/走/看/安静/其他，权重 0.05–1，你可以增删改；strength_options 只能 不思考/low；reaction_options 只能 小/中/大。
 - 必须是合法 JSON，且这个块必须放在整条回复的最后。`;
       }
 
@@ -1855,10 +1991,13 @@ async function fetchSkillDetail(name) {
 
 async function submit(text, opts = {}) {
   const isLifeTurn = !!opts.life;
+  const round = acquireRound(isLifeTurn);
+  if (!round) return;
   if (!isLifeTurn) {
     // The user's direct message is a hard interrupt: it cancels the pending
     // life round. submit() re-arms the loop after this turn completes.
     _lastUserActivity = Date.now();
+    _nextTempo = null;
     cancelLifeLoop();
     cancelProactiveChat(); // legacy timer must not fire into the user's turn
   }
@@ -1868,17 +2007,47 @@ async function submit(text, opts = {}) {
   // extraction for it.
   const isProactiveTurn = isLifeTurn || /^\s*\[系统提示/.test(String(text || ""));
   if (isLifeTurn && phase === "ask") {
-    // Close the stale input so a life round cannot race the user's typing.
-    // No bubble is shown: the first real reply delta calls showSpeak().
-    await hideBubble({ fade: true });
+    // Keep the previous reply/input surface visible: life rounds should feel
+    // continuous instead of collapsing the box between rounds. submitLifeRound
+    // only starts when the user is not typing/focused, so nothing is lost.
   }
   // Fresh turn — the model hasn't (yet) emitted a [NEXT_CHAT] tag for
   // THIS reply. Set true when the `next_chat` SSE event arrives. LifeLoop
   // ignores it; the legacy plugin may still read it if re-enabled.
   _nextChatExplicit = false;
-  // 心声轮：模型选择了"在心里想"（[INNER:…]）——这一轮用户什么都
-  // 不该看到。流结束后静默收起气泡。
   _innerTurn = false;
+  let _awaitingResponse = true;
+  const historySnapshot = round.history.slice();
+  function record(entry) {
+    if (ownsRound(round) && round.history === curHistory() && !isProactiveTurn) {
+      round.history.push(entry);
+    }
+  }
+  async function paintView() {
+    if (!canPaint(round) || !_awaitingResponse) return false;
+    if (!round.view) {
+      round.view = _viewVersion;
+      round.draft = hasDraft() ? inputEl.value : null;
+      return true;
+    }
+    return round.view === _viewVersion;
+  }
+  async function repaint(render) {
+    if (await paintView()) await render();
+  }
+  // Command replies are user turns only; no model work is left pending.
+  async function commandFinish(cmd) {
+    if (!ownsRound(round)) return;
+    if (cmd.resetHistory) {
+      replaceActiveHistory([]);
+    } else {
+      record({ role: "user", content: text });
+      record({ role: "assistant", content: cmd.text });
+    }
+    await showCommandReply(cmd);
+    round.pending = false;
+    finishRound(round);
+  }
 
   // Try command intents first. If matched, render the result as the
   // assistant turn and skip the model call entirely.
@@ -1888,20 +2057,7 @@ async function submit(text, opts = {}) {
       // is being worked on (model/engine swaps take ~3-4 s).
       await showCommandProgress(progressText);
     });
-    if (cmd) {
-      if (cmd.resetHistory) {
-        // Model swap: the chat "voice" just changed, so we wipe
-        // the entire prior history AND we don't even keep this admin turn
-        // — meta-config chatter shouldn't anchor the new model.
-        replaceActiveHistory([]);
-      } else {
-        history.push({ role: "user", content: text });
-        history.push({ role: "assistant", content: cmd.text });
-      }
-      await showCommandReply(cmd);
-      scheduleLifeLoop();
-      return;
-    }
+    if (cmd) { await commandFinish(cmd); return; }
   } catch (err) {
     console.error("command dispatch error:", err);
   }
@@ -1912,15 +2068,16 @@ async function submit(text, opts = {}) {
     const skillName = skillMatch[1].trim();
     const detail = await fetchSkillDetail(skillName);
     if (detail && detail.body) {
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: t("chatSkillLoaded", { name: detail.name, body: detail.body }) });
+      record({ role: "user", content: text });
+      record({ role: "assistant", content: t("chatSkillLoaded", { name: detail.name, body: detail.body }) });
       await showCommandReply({ ok: true, text: t("chatSkillLoadedReply", { name: detail.name }) });
     } else {
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: t("chatSkillNotFound", { name: skillName }) });
+      record({ role: "user", content: text });
+      record({ role: "assistant", content: t("chatSkillNotFound", { name: skillName }) });
       await showCommandReply({ ok: false, text: t("chatSkillNotFoundReply", { name: skillName }) });
     }
-    scheduleLifeLoop();
+    round.pending = false;
+    finishRound(round);
     return;
   }
 
@@ -1939,10 +2096,7 @@ async function submit(text, opts = {}) {
     } catch {}
     const prompt = promptResp.prompt || "";
     if (!prompt) {
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: "学技能的接口没连上——检查 sidecar 是否在跑。" });
-      await showCommandReply({ ok: false, text: "学技能接口不可用。" });
-      scheduleLifeLoop();
+      await commandFinish({ ok: false, text: "学技能接口不可用。" });
       return;
     }
     // Submit the learn prompt as the driving instruction. The prompt already
@@ -1950,8 +2104,6 @@ async function submit(text, opts = {}) {
     // separate turn — that would double-feed it. The model authors + saves
     // the skill itself via skill_create.
     await submit(prompt);
-    // The nested submit() already armed the loop; keep this turn's exit safe.
-    if (!_lifeTimer) scheduleLifeLoop();
     return;
   }
 
@@ -1964,10 +2116,11 @@ async function submit(text, opts = {}) {
       } else {
         _sessionProvider = provider;
       }
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: `Switched to ${provider} model.` });
+      record({ role: "user", content: text });
+      record({ role: "assistant", content: `Switched to ${provider} model.` });
       await showCommandReply({ ok: true, text: `Switched to ${provider} model.`, resetHistory: true });
-    scheduleLifeLoop();
+    round.pending = false;
+    finishRound(round);
     return;
   }
 
@@ -1976,13 +2129,14 @@ async function submit(text, opts = {}) {
     try {
       const prov = await window.pet.listProviders();
       const names = (prov.providers || []).map((p) => p.name).join(", ");
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: `Available providers: ${names || "local (only local is available)"}.` });
+      record({ role: "user", content: text });
+      record({ role: "assistant", content: `Available providers: ${names || "local (only local is available)"}.` });
       await showCommandReply({ ok: true, text: `Providers: ${names || "local"}` });
     } catch {
       await showCommandReply({ ok: false, text: "Could not fetch providers." });
     }
-    scheduleLifeLoop();
+    round.pending = false;
+    finishRound(round);
     return;
   }
 
@@ -1993,17 +2147,18 @@ async function submit(text, opts = {}) {
       const data = await window.pet.mcpListServers();
       const tools = (data.tools || []).map((t) => `  - ${t.name} (${t.server_name}): ${t.description}`).join("\n");
       const msg = tools ? `MCP tools:\n${tools}` : "No MCP servers connected.";
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: msg });
+      record({ role: "user", content: text });
+      record({ role: "assistant", content: msg });
       await showCommandReply({ ok: true, text: msg });
     } catch {
       await showCommandReply({ ok: false, text: "Could not fetch MCP tools." });
     }
-    scheduleLifeLoop();
+    round.pending = false;
+    finishRound(round);
     return;
   }
 
-  history.push({ role: "user", content: text });
+  record({ role: "user", content: text });
 
   // If the user explicitly asks to see the screen (not proactive trigger),
   // fetch screen context immediately so the model can respond naturally.
@@ -2018,8 +2173,7 @@ async function submit(text, opts = {}) {
   // Hold this turn's controller in a local binding: cmdOpen/cmdDismiss (or
   // an intervening showAsk) may clear/replace the global `abortCtrl` while
   // we await below, and the fetch must not dereference a null global.
-  const ctrl = new AbortController();
-  abortCtrl = ctrl;
+  const ctrl = round.ctrl;
 
   let replyAcc = "";
   let thinkAcc = "";
@@ -2075,19 +2229,16 @@ async function submit(text, opts = {}) {
   // estimate keeps the oldest turns from silently overflowing llama-server's
   // KV window (default 4096). `messagesToSend` is what we transmit; we also
   // prune `history` itself to the turn cap so memory stays bounded.
-  let messagesToSend = history;
+  let messagesToSend = historySnapshot.slice();
   if (chatContext && typeof chatContext.trimHistoryForContext === "function") {
-    messagesToSend = chatContext.trimHistoryForContext(history, { maxNewTokens });
+    messagesToSend = chatContext.trimHistoryForContext(historySnapshot, { maxNewTokens });
     const cap = chatContext.MAX_HISTORY_TURNS;
     if (Number.isFinite(cap) && history.length > cap) {
-      // `history` is a const Proxy delegating to the active topic's
-      // messages array — reassigning the binding throws a TypeError under
-      // strict mode, so drop the oldest turns in place on the underlying
-      // array instead.
       const drop = curHistory().length - cap;
       if (drop > 0) curHistory().splice(0, drop);
     }
   }
+  messagesToSend.push({ role: "user", content: text });
 
   // Phase 2: attach provider routing preferences. Fetched BEFORE the
   // system prompt is built: a loopback endpoint (LM Studio / llama.cpp /
@@ -2101,13 +2252,15 @@ async function submit(text, opts = {}) {
   } catch {}
   // Session overrides take priority (set by /model commands)
   if (_sessionProvider !== null) providerPrefs.defaultProvider = _sessionProvider;
-  // Remember which provider actually served this turn so the continuous
-  // scheduler can pick the web gap (quota guard) instead of the API gap.
-  _lastProviderName = String(providerPrefs.defaultProvider || "").toLowerCase();
-  const activeProvCfg = (providerPrefs.modelProviders || []).find(function(p) {
-    return p && p.provider === providerPrefs.defaultProvider;
+  const effectiveProvider = String(providerPrefs.defaultProvider || "local").toLowerCase();
+  const effectivePrefs = Object.assign({}, providerPrefs, {
+    defaultProvider: effectiveProvider,
   });
-  const localEndpoint = _isLocalProviderPrefs(providerPrefs);
+  _lastProviderName = effectiveProvider;
+  const activeProvCfg = (providerPrefs.modelProviders || []).find(function(p) {
+    return p && p.provider === effectiveProvider;
+  });
+  const localEndpoint = _isLocalProviderPrefs(effectivePrefs);
   // Loopback endpoints default to a tool-free prompt. "toolsEnabled": true
   // in ~/.pet/providers.json is the explicit opt-in (same flag the gateway
   // reads), so a capable local model can still get the tool instructions.
@@ -2116,7 +2269,7 @@ async function submit(text, opts = {}) {
   // The web bridge is not a long-lived conversation: every request opens a
   // fresh chat and pays for the whole system prompt again. Use the compact
   // skill/tool listing + a shorter history window on this provider only.
-  const webPrompt = String(providerPrefs.defaultProvider || "").toLowerCase() === "deepseek-web";
+  const webPrompt = effectiveProvider === "deepseek-web";
   if (webPrompt && messagesToSend.length > 8) {
     messagesToSend = messagesToSend.slice(-8);
   }
@@ -2125,7 +2278,7 @@ async function submit(text, opts = {}) {
   // what skills are at its disposal.
   const skillsContext = await fetchSkillsContext(text, {
     allowTools,
-    provider: providerPrefs.defaultProvider,
+    provider: effectiveProvider,
     compact: webPrompt,
   });
   const body = {
@@ -2147,8 +2300,8 @@ async function submit(text, opts = {}) {
     body.system = skillsContext;
   }
 
-  if (providerPrefs.defaultProvider && providerPrefs.defaultProvider !== "local") {
-    body.model_provider = providerPrefs.defaultProvider;
+  if (effectiveProvider && effectiveProvider !== "local") {
+    body.model_provider = effectiveProvider;
     if (activeProvCfg && activeProvCfg.contextWindow) body.context_window = Number(activeProvCfg.contextWindow);
   }
 
@@ -2167,7 +2320,7 @@ async function submit(text, opts = {}) {
     // If the provider supports vision, also inject the raw screenshot as an
     // image_url content block in the last user message so multimodal models
     // can see both the structured labels AND the actual screen pixels.
-    var supportsVision = _providerSupportsVision(providerPrefs);
+    var supportsVision = _providerSupportsVision(effectivePrefs);
     if (supportsVision && _pendingScreenContext.rawScreenshotBase64 && messagesToSend.length > 0) {
       var lastIdx = messagesToSend.length - 1;
       var lastMsg = messagesToSend[lastIdx];
@@ -2199,12 +2352,13 @@ async function submit(text, opts = {}) {
     if (!resp.ok) throw new Error("HTTP " + resp.status);
 
     const reader = resp.body.getReader();
+    round.reader = reader;
     const dec = new TextDecoder();
     let buf = "";
 
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done || !ownsRound(round)) break;
       buf += dec.decode(value, { stream: true });
       let idx;
       while ((idx = buf.indexOf("\n\n")) >= 0) {
@@ -2233,7 +2387,7 @@ async function submit(text, opts = {}) {
           // typewriter, then transition to a fresh reply bubble. Empty
           // deltas must not surface an empty bubble (life rounds stay silent
           // until there is real visible text).
-          if (!sawReply && obj.content) {
+          if (!sawReply && obj.content && await repaint(async () => {
             sawReply = true;
             clearTimeout(slowHint);
             if (typer) await typer.drain();
@@ -2244,28 +2398,45 @@ async function submit(text, opts = {}) {
             await showSpeak();
             speakEl = document.getElementById("speak");
             typer = new Typewriter(speakEl, { onChange: onTick });
-          }
+          })) { /* result is saved even when the draft protects the surface */ }
           replyAcc += obj.content;
-          typer.feed(obj.content);
+          if (typer && canPaint(round)) typer.feed(obj.content);
           // LingLing: token-level micro-animation trigger
           _linglingOnToken(obj.content);
         } else if (obj.event === "error") {
           throw new Error(obj.message || "model error");
-        } else if (obj.event === "walk") {
-          // 身体移动: the model walks itself — the shell animates the body
-          if (window.pet && typeof window.pet.petWalk === "function") {
-            window.pet.petWalk(Number(obj.dx) || 0, Number(obj.dy) || 0);
-          }
-        } else if (obj.event === "walk_desktop") {
-          if (window.pet && typeof window.pet.petHopDesktop === "function") {
-            window.pet.petHopDesktop();
-          }
         } else if (obj.event === "next_chat") {
           // Store the legacy [NEXT_CHAT] hint only. The LifeLoop ignores it
           // entirely (quiet / 0 / no tag all keep the life going), and the old
           // proactive timer is not armed here.
-          _nextChatSeconds = Number(obj.seconds) || 0;
-          _nextChatExplicit = obj.explicit !== false;
+          round.nextChatSeconds = Number(obj.seconds) || 0;
+          round.nextChatExplicit = obj.explicit !== false;
+        } else if (obj.event === "tempo") {
+          const mode = String(obj.mode || "").toLowerCase();
+          if (TEMPO_RANGES[mode]) round.tempo = mode;
+        } else if (obj.event === "next_check_s") {
+          // 快直觉轮的下发自定义节拍（网关已钳制在节奏档内）。优先于
+          // tempo 采样： reflex 说等多久就等多久，失败时网关发档位中点。
+          const secs = Number(obj.seconds);
+          if (Number.isFinite(secs) && secs > 0) round.nextCheckS = Math.round(secs);
+        } else if (obj.event === "sleep_state") {
+          // 生命体征短路轮（睡着了/充电中/死亡）：不弹文本气泡——网关已
+          // 不再为短路轮发可见 delta——改为一次性状态指示，同态不重复。
+          // 自然醒来后下一轮不再携带本事件，finishRound 自愈清除。
+          const st = String(obj.state || "");
+          round.sleepSeen = true;
+          if (st && st !== _sleepState) {
+            _sleepState = st;
+            const hint = st === "asleep" ? "💤 睡着了……"
+              : st === "forced_off" ? "🔋 电量耗尽，充电中……"
+              : "……";
+            void (async () => {
+              try {
+                await showThinking(hint);
+                setTimeout(() => { if (phase === "thinking") hideBubble({ fade: true }); }, 1800);
+              } catch {}
+            })();
+          }
         } else if (obj.event === "end") {
           // The gateway finished a round (even a quiet one). A completed
           // round proves the bridge is alive → clear the error backoff.
@@ -2285,11 +2456,10 @@ async function submit(text, opts = {}) {
     // 心声轮提前退出：模型选择"在心里想"，内容被网关截走写进了它的
     // 瞬时记忆——这里没有任何可见内容，也不该有。静默收起气泡，
     // 不写可见历史，不显示空回复。（服务端照常做记忆/情绪提取。）
-    if (_innerTurn) {
-      if (abortCtrl === ctrl) abortCtrl = null;
-      await hideBubble({ fade: true });
-      // An inner round is still a completed round: keep the life going.
-      scheduleLifeLoop();
+    if (_innerTurn && !replyAcc.trim()) {
+      await repaint(() => hideBubble({ fade: true }));
+      round.pending = false;
+      finishRound(round);
       return;
     }
 
@@ -2312,14 +2482,9 @@ async function submit(text, opts = {}) {
     // but the renderer must never silently collapse on an empty reply.
     if (!replyAcc.trim() || isToolStatusOnlyReply(replyAcc)) {
       if (isProactiveTurn) {
-        // Quiet proactive round: no visible text at all. The gateway has
-        // already run memory/DSTATE extraction, so hide the bubble silently
-        // and leave no visible assistant history (mirrors the _innerTurn
-        // path above). The LifeLoop is re-armed below: quiet never stops it.
-        if (abortCtrl === ctrl) abortCtrl = null;
-        await hideBubble({ fade: true });
-        // A quiet round is still a completed round: keep the life going.
-        scheduleLifeLoop();
+        await repaint(() => hideBubble({ fade: true }));
+        round.pending = false;
+        finishRound(round);
         return;
       }
       replyAcc = "我没整理出答案，再试一次？";
@@ -2329,7 +2494,7 @@ async function submit(text, opts = {}) {
       }
     }
 
-	    history.push({ role: "assistant", content: replyAcc, thinking: thinkAcc || null });
+    record({ role: "assistant", content: replyAcc, thinking: thinkAcc || null });
 	    _persistHistory();
 
 	    // LingLing: extract events + update mood from this conversation turn
@@ -2372,39 +2537,31 @@ async function submit(text, opts = {}) {
     fadeTimer = setTimeout(async () => {
       fadeTimer = null;
       // Re-render with the previous reply pinned dimly above a fresh input.
-      await showAsk(lastReply, lastThinking);
-      // Auto-fade if user idles in ask phase for ~25s.
-      fadeTimer = setTimeout(() => {
-        fadeTimer = null;
-        if (phase === "ask" && (!inputEl || !inputEl.value.trim())) {
-          hideBubble({ fade: true });
-        }
-      }, 25000);
+      // Life rounds must not steal keyboard focus: if they did, the focus
+      // check in submitLifeRound() would pause the continuous loop forever.
+      // The box stays visible instead of auto-fading, so the pet keeps a
+      // flowing output surface while life continues.
+      _awaitingResponse = false;
+      // The user may have typed while the pet was streaming; carry that
+      // draft across the rebuild so it is never wiped.
+      const draft = inputEl ? inputEl.value : "";
+      await repaint(async () => {
+        await showAsk(lastReply, lastThinking, { autoFocus: !isLifeTurn });
+        if (draft && inputEl) { inputEl.value = draft; autoresizeFixed(inputEl); }
+      });
     }, readingMs);
 
-    // Every completed turn (user or life) resumes the LifeLoop. [NEXT_CHAT]
-    // and the legacy proactive policy are deliberately ignored here.
-    scheduleLifeLoop();
-
-    // Only release the global handle if it is still THIS turn's controller;
-    // never clobber one installed by a newer submit/open in the meantime.
-    if (abortCtrl === ctrl) abortCtrl = null;
+    round.pending = false;
+    finishRound(round);
 
   } catch (err) {
     clearTimeout(slowHint);
     if (typer) typer.stop();
-    if (abortCtrl === ctrl) abortCtrl = null;
-    if (err.name === "AbortError") {
-      // Aborts are user interrupts, not a reason for the life to stop.
-      scheduleLifeLoop();
-      return;
-    }
-    // Keep the bubble visible with the actual failure text. Hiding it here
-    // used to leave the user with nothing but "the reply disappeared".
+    if (!ownsRound(round) || err.name === "AbortError") return;
     const detail = err && err.message ? err.message : String(err);
-    await showError("模型连接出错：" + detail + "，请重试");
-    // Errors back off (showError bumped _lifeFailures) but never stop the loop.
-    scheduleLifeLoop();
+    await repaint(() => showError("模型连接出错：" + detail + "，请重试"));
+    round.pending = false;
+    finishRound(round);
   }
 }
 
@@ -2460,7 +2617,9 @@ class Typewriter {
   stop() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     this.buf = "";
+    const pending = this._doneResolvers.slice();
     this._doneResolvers = [];
+    pending.forEach((resolve) => resolve());
   }
   reset(target) {
     this.stop();
@@ -2473,10 +2632,7 @@ class Typewriter {
 async function cmdOpen({ side } = {}) {
   if (side) setSide(side);
   // If we were waiting / generating, dismiss it so the user can type.
-  if (abortCtrl) {
-    try { abortCtrl.abort(); } catch {}
-    abortCtrl = null;
-  }
+  invalidateRound();
   if (!await ensureBooted()) return;
   // Sync the active theme (持续自我存在) — the sidecar's memory and
   // this renderer's history both belong to the current theme.
@@ -2493,7 +2649,6 @@ async function cmdOpen({ side } = {}) {
   // and every prior conversation is lost — even though it's still on disk.
   await _restoreHistory();
   await showAsk();
-  _askOpenedAt = Date.now();
 }
 
 // Silent startup path for `?boot=1`: boot the sidecar session, sync theme and
@@ -2518,10 +2673,7 @@ async function bootOpen() {
 }
 
 async function cmdDismiss() {
-  if (abortCtrl) {
-    try { abortCtrl.abort(); } catch {}
-    abortCtrl = null;
-  }
+  invalidateRound();
   await hideBubble({ fade: true });
 }
 
@@ -2645,7 +2797,7 @@ if (window.pet) {
 // fixed sample. Settings captures bubble.getBounds() on save and turns
 // that into a (dx, dy) offset relative to the pet hit rect.
 async function enterEditMode() {
-  if (abortCtrl) { try { abortCtrl.abort(); } catch {} abortCtrl = null; }
+  invalidateRound();
   clearFade();
   phase = "narration";
   // Apply drag region to body and the bubble shell.
@@ -2672,7 +2824,7 @@ function exitEditMode() {
 async function showNarration({ text, kind }) {
   if (!text) return;
   if (phase === "speak" || phase === "think-stream") return;
-  if (abortCtrl) { try { abortCtrl.abort(); } catch {} abortCtrl = null; }
+  invalidateRound();
 
   clearFade();
   phase = "narration";

@@ -162,7 +162,8 @@
       "extensions/**/*",
       "agents/**/*",
       "themes/**/*",
-      "pwa/**/*"
+      "pwa/**/*",
+      "vendor/**/*"
     ],
     "asarUnpack": [
       "assets/svg/**/*",

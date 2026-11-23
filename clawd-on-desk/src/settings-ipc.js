@@ -22,6 +22,9 @@ const WEB_BRIDGE_PORT = 8766;
 const WEB_BRIDGE_SCRIPT = defaultPath.join(
   __dirname, "..", "..", "pet-sidecar", "deepseek_web", "bridge.py"
 );
+const WEB_EXTENSION_DIR = defaultPath.join(
+  defaultPath.dirname(WEB_BRIDGE_SCRIPT), "extension"
+);
 // Dedicated browser profile used by the web-model setup (extension installed
 // once). Override with PET_WEB_CHROME_PROFILE; if it does not exist we fall
 // back to the user's default browser.
@@ -1134,8 +1137,12 @@ function registerSettingsIpc(options = {}) {
     }
   });
 
-  handle("settings:web-model-test", async () => {
-    const started = Date.now();
+  handle("settings:web-model-reset-session", async () => {
+    const r = await webBridgeJson("POST", "/session/reset", 3000, {});
+    return r.ok ? { status: "ok" } : { status: "error", message: r.error || "重置失败" };
+  });
+
+  handle("settings:web-model-test", async () => {    const started = Date.now();
     const r = await webBridgeJson(
       "POST",
       "/v1/chat/completions",
@@ -1157,16 +1164,26 @@ function registerSettingsIpc(options = {}) {
       if (defaultFs.existsSync(WEB_CHROME_PROFILE)) {
         const chrome = WEB_CHROME_CANDIDATES.find((candidate) => defaultFs.existsSync(candidate));
         if (chrome) {
-          const child = defaultChildProcess.spawn(chrome, [
+          const args = [
             `--user-data-dir=${WEB_CHROME_PROFILE}`,
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows",
-            "--disable-features=CalculateNativeWinOcclusion",
+            "--disable-features=CalculateNativeWinOcclusion,DisableLoadExtensionCommandLineSwitch",
             "https://chat.deepseek.com/",
-          ], { detached: true, windowsHide: false, stdio: "ignore" });
+          ];
+          // Recent Chrome ignores --load-extension unless that feature is
+          // disabled. Loading it here means "打开 DeepSeek" works even when
+          // the dedicated profile never had the unpacked extension installed
+          // through chrome://extensions.
+          if (defaultFs.existsSync(WEB_EXTENSION_DIR)) {
+            args.splice(args.length - 1, 0, `--load-extension=${WEB_EXTENSION_DIR}`);
+          }
+          const child = defaultChildProcess.spawn(chrome, args, {
+            detached: true, windowsHide: false, stdio: "ignore",
+          });
           child.on("error", () => {});
           child.unref();
           return { status: "ok", launched: true };

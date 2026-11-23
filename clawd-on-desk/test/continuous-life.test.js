@@ -39,7 +39,7 @@ test("life rounds are silent until a real delta and submit re-arms the loop", ()
   assert.match(code, /if \(!isLifeTurn\) \{[\s\S]*?cancelLifeLoop\(\)/);
   assert.match(code, /if \(!isLifeTurn\) \{[\s\S]*?await showThinking/);
   assert.match(code, /await submit\(LIFE_PROMPT, \{ life: true \}\)/);
-  assert.match(code, /scheduleLifeLoop\(\);\s*\n\s*\/\/ Only release the global handle/);
+  assert.match(code, /round\.pending = false;\s*\n\s*finishRound\(round\);/);
 });
 
 test("the legacy proactive scheduler is inert by default", () => {
@@ -82,7 +82,7 @@ test("errors back off but keep scheduling; a finished round resets the count", (
   assert.match(code, /_lifeFailures \+= 1/);
   assert.match(code, /if \(_lifeFailures >= 2\) delay = Math\.max\(delay, LIFE_ERROR_BACKOFF_MS\)/);
   assert.match(code, /_lifeFailures = 0/); // SSE end
-  assert.match(code, /showError\([\s\S]{0,200}scheduleLifeLoop\(\)/);
+  assert.match(code, /showError\([\s\S]{0,200}finishRound\(round\)/);
 });
 
 test("pet-chat.html no longer loads the retired continuous-life helper", () => {

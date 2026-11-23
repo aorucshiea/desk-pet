@@ -246,6 +246,7 @@ contextBridge.exposeInMainWorld("petSettings", {
   webModelStart: () => ipcRenderer.invoke("settings:web-model-start"),
   webModelSetLimit: (limit) => ipcRenderer.invoke("settings:web-model-set-limit", limit),
   webModelTest: () => ipcRenderer.invoke("settings:web-model-test"),
+  webModelResetSession: () => ipcRenderer.invoke("settings:web-model-reset-session"),
   webModelOpen: () => ipcRenderer.invoke("settings:web-model-open"),
   webModelReveal: () => ipcRenderer.invoke("settings:web-model-reveal"),
 });

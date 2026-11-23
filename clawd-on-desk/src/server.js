@@ -326,38 +326,30 @@ function handleWorldAddPost(req, res, { ctx }) {
   });
 }
 
-function handlePetWalkPost(req, res, { ctx }) {
+function handlePetActionPost(req, res, { ctx, legacyWalk = false }) {
   const chunks = [];
   let size = 0;
   req.on("data", (chunk) => {
     size += chunk.length;
-    if (size > 4096) {
-      try { req.destroy(); } catch {}
-      return;
-    }
+    if (size > 4096) { try { req.destroy(); } catch {} return; }
     chunks.push(chunk);
   });
-  req.on("end", () => {
+  req.on("end", async () => {
     let payload = {};
-    try {
-      payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
-    } catch {}
+    try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); } catch {}
     const reply = (code, obj) => {
       res.writeHead(code, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
     };
-    const move = typeof ctx.walkPet === "function" ? ctx.walkPet : null;
-    if (!move) {
-      reply(503, { status: "error", message: "walk unavailable" });
+    if (typeof ctx.actPet !== "function") {
+      reply(503, { status: "error", applied: false, message: "body action unavailable" });
       return;
     }
+    const action = legacyWalk ? { kind: "walk", dx: payload.dx, dy: payload.dy } : payload;
     let out;
-    try {
-      out = move(Number(payload && payload.dx) || 0, Number(payload && payload.dy) || 0);
-      if (!out || typeof out !== "object") out = { status: "error", message: "walk returned nothing" };
-    } catch (err) {
-      out = { status: "error", message: (err && err.message) || String(err) };
-    }
+    try { out = await ctx.actPet(action); }
+    catch (err) { out = { status: "error", applied: false, message: (err && err.message) || String(err) }; }
+    if (!out || typeof out !== "object") out = { status: "error", applied: false, message: "body action returned nothing" };
     reply(out.status === "ok" ? 200 : 400, out);
   });
 }
@@ -439,9 +431,10 @@ function startHttpServer() {
     } else if (req.method === "POST" && req.url === "/world/op") {
       // AI 操作刚体：{ id, action: "push"|"pull"|"kick"|"grab", distance? }
       handleWorldOpPost(req, res, { ctx });
+    } else if (req.method === "POST" && req.url === "/pet/act") {
+      handlePetActionPost(req, res, { ctx });
     } else if (req.method === "POST" && req.url === "/pet/walk") {
-      // AI 自主移动：{ dx, dy }（决策层/测试用，clamp 到工作区）
-      handlePetWalkPost(req, res, { ctx });
+      handlePetActionPost(req, res, { ctx, legacyWalk: true });
     } else {
       res.writeHead(404);
       res.end();
