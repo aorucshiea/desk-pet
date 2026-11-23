@@ -247,7 +247,7 @@ async def test_prefill_contract_request_shape():
     assert body["response_format"]["type"] == "json_schema"
     assert schema["name"] == "reflex"
     assert schema["strict"] is True
-    assert schema["schema"]["required"] == ["action", "think", "reaction", "next_check_s", "reason"]
+    assert schema["schema"]["required"] == ["action", "think", "reaction", "next_check_s", "reason", "time_relevant", "time_note"]
     assert schema["schema"]["additionalProperties"] is False
     assert schema["schema"]["properties"]["action"]["enum"] == [
         "speak", "look", "walk", "quiet", "other",
@@ -446,6 +446,8 @@ async def test_disabled_config_never_sends_request():
         "action": "quiet",
         "think": False,
         "reaction": "small",
+        "time_relevant": False,
+        "time_note": "",
         "next_check_s": 300,
         "reason": "",
         "source": "fallback",
@@ -515,9 +517,47 @@ def test_user_prompt_is_compact_chinese_lines_not_json():
     assert "最近心声：好安静；有点困" in prompt
     assert "{" not in prompt and "}" not in prompt
     assert json.dumps(_NIGHT_STATE, ensure_ascii=False) not in prompt
-    assert "当前时间：（未知）" in prompt
+    # 默认不授时：模型没标 time_relevant 就没有当前时间行
+    assert "当前时间：" not in prompt
+    assert "【D 开场的自我提问】" in prompt
+    assert "我需要知道现在的时间吗" in prompt
     lines = [line for line in prompt.split("\n") if line]
-    assert len(lines) == 8
+    assert len(lines) == 12
+
+
+def test_time_line_only_appears_when_model_asked_for_time():
+    """授时闭环：只有模型上一轮标了 time_relevant，state 带了时间才显示。"""
+    base = dict(_NIGHT_STATE)
+    base["current_time"] = "03:12"
+    base["elapsed_since_main_s"] = 600.0
+    prompt = build_user_prompt(base, "slow")
+    assert "当前时间：03:12" in prompt
+    assert "距上次主脑轮：10 分钟" in prompt
+
+
+@pytest.mark.asyncio
+async def test_reflect_thinking_mode_no_prefill_and_text_output():
+    """reflect 是思考档快直觉：不做 prefill、不限制 JSON，返回正文。"""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "昨晚我主要在安静守着，没做什么。"}}]
+        })
+
+    out = await reflex.reflect(
+        "用一句话总结最近 100 轮",
+        _config(),
+        transport=httpx.MockTransport(handler),
+    )
+    assert out["text"] == "昨晚我主要在安静守着，没做什么。"
+    assert out["source"] == "reflex-think"
+    body = seen["body"]
+    # 不做 prefill（最后一条是 user，不是 assistant 的 "{"）
+    assert body["messages"][-1]["role"] == "user"
+    assert body["max_tokens"] == 512
+    assert "response_format" not in body
 
 
 def test_user_prompt_defaults_fill_missing_state():

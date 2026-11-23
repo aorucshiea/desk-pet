@@ -6582,8 +6582,17 @@ async def _stream_chat_provider(
             "mood": _mood_label_for_reflex(_rx_mood_idx),
             "recent_thoughts": _rx_thoughts,
             "d_action": str(_decision.get("action") or "quiet"),
-            "current_time": datetime.now().strftime("%H:%M"),
         }
+        # 授时闭环：只有上一轮小模型自己标了 time_relevant（它说"我需要
+        # 知道时间"），这一轮才附上当前时间和距上次主脑轮的时长。
+        # 不主动报时——时间感是模型自己的选择，不是系统塞给它的。
+        if isinstance(_reflex_decision, dict) and _reflex_decision.get("time_relevant"):
+            _reflex_state["current_time"] = datetime.now().strftime("%H:%M")
+            _last_main_at = float(_DENSITY_STATE.get("last_round_at") or 0.0)
+            if _last_main_at > 0:
+                _reflex_state["elapsed_since_main_s"] = max(
+                    0.0, time.time() - _last_main_at
+                )
         _rx_started = time.perf_counter()
         _reflex_decision = await _reflex_module.judge(
             _reflex_state, _rx_cfg

@@ -125,8 +125,10 @@ _REFLEX_SCHEMA: Dict[str, Any] = {
         "reaction": {"type": "string", "enum": ["small", "medium", "large"]},
         "next_check_s": {"type": "integer"},
         "reason": {"type": "string"},
+        "time_relevant": {"type": "boolean"},
+        "time_note": {"type": "string"},
     },
-    "required": ["action", "think", "reaction", "next_check_s", "reason"],
+    "required": ["action", "think", "reaction", "next_check_s", "reason", "time_relevant", "time_note"],
     "additionalProperties": False,
 }
 _RESPONSE_FORMAT: Dict[str, Any] = {
@@ -146,6 +148,8 @@ _SYSTEM_PROMPT = """你是桌宠的快直觉核心（潜意识）。职责：用
 - reaction：升级时大脑的持续反应力度。small=简短回应(1536 tok)、medium=中等(2560 tok)、large=深入(4096 tok)。quiet 时选 small。
 - next_check_s：距下次自查的秒数，必须落在当前节奏档内。
 - reason：最关键的一句话，不超过20个中文字；升级（非 quiet/非 think=false）时必须写出理由。
+- time_relevant：这件事跟时间有关吗？只有确实需要知道现在的时间（比如睡觉、等待、日常节奏）才为 true；其他情况 false。系统只在你标记 true 后才把时间给你。
+- time_note：你觉得“之前/刚刚做的事已经过去了多久”的估计（用台账时间戳推）；不知道就留空字符串。
 
 节奏锚定（next_check_s 必须落在当前档位区间内，用户消息会给出当前档位）：
 - slow：240–360 秒；fast：90–150 秒；ultra：50–70 秒。
@@ -286,8 +290,12 @@ def build_user_prompt(state: Mapping[str, Any], tier: str) -> str:
         if len(thoughts) >= _MAX_RECENT_THOUGHTS:
             break
     lines = [
+        "【D 开场的自我提问】（在 time_relevant / time_note 里作答）",
+        "- 之前或者刚刚我在做什么？（看状态摘要与最近心声）",
+        "- 我需要知道现在的时间吗？只有事情跟时间相关才需要——需要时 time_relevant=true。",
+        "- 我之前或者刚刚做的事情已经过去了多久？若重要，用台账的时间戳估计写进 time_note；不知道就留空。",
+        "【这一拍的状态】",
         f"状态：{summary}",
-        f"当前时间：{str(state.get('current_time') or '').strip() or '（未知）'}",
         f"节奏：{tier}（next_check_s 取 {lo}–{hi} 秒）",
         f"用户新消息：{_as_int(state.get('new_events'))} 条",
         f"用户在场：{'是' if state.get('user_present') else '否'}",
@@ -295,6 +303,13 @@ def build_user_prompt(state: Mapping[str, Any], tier: str) -> str:
         f"心情：{str(state.get('mood') or '').strip() or '平静'}",
         "最近心声：" + ("；".join(thoughts) if thoughts else "（无）"),
     ]
+    # 时间是"模型求时才给"：只有上一轮它标了 time_relevant，这一轮才附。
+    current_time = str(state.get("current_time") or "").strip()
+    if current_time:
+        lines.append(f"当前时间：{current_time}")
+    elapsed = state.get("elapsed_since_main_s")
+    if isinstance(elapsed, (int, float)) and elapsed > 0:
+        lines.append(f"距上次主脑轮：{int(elapsed // 60)} 分钟")
     return "\n".join(lines)
 
 
@@ -373,12 +388,21 @@ def _validate_decision(data: Any, tier: str) -> Tuple[Optional[dict], str]:
     if reaction not in ("small", "medium", "large"):
         reaction = "small"
 
+    raw_time_rel = data.get("time_relevant")
+    if isinstance(raw_time_rel, str):
+        time_relevant = raw_time_rel.strip().lower() == "true"
+    else:
+        time_relevant = bool(raw_time_rel) if raw_time_rel is not None else False
+    time_note = str(data.get("time_note") or "").strip()[:_REASON_MAX_CHARS]
+
     return {
         "action": action,
         "think": think,
         "reaction": reaction,
         "next_check_s": next_check,
         "reason": reason,
+        "time_relevant": time_relevant,
+        "time_note": time_note,
         "source": "reflex",
     }, ""
 
@@ -390,6 +414,8 @@ def _fallback(tier: str, failure: str) -> dict:
         "action": "quiet",
         "think": False,
         "reaction": "small",
+        "time_relevant": False,
+        "time_note": "",
         "think": False,
         "next_check_s": (lo + hi) // 2,
         "reason": "",
@@ -525,8 +551,85 @@ def adjust_config(config: ReflexConfig, **changes: Any) -> ReflexConfig:
     return replace(config, **changes)
 
 
+# 思考档快直觉（reflect）：其余小模型工作（潜意识出题、睡眠批答、晨间批阅
+# 草稿、回顾草稿）走这条——**允许完整推理**（不做 prefill，不吃 128 上限）。
+DEFAULT_REFLECT_MAX_TOKENS = 512
+DEFAULT_REFLECT_TIMEOUT_S = 30.0
+
+_REFLECT_SYSTEM = (
+    "你是桌宠的快直觉（潜意识推理层）。可以充分思考；最终只输出简洁的中文"
+    "正文，不要 JSON、不要解释自己的思考过程。"
+)
+
+
+async def reflect(
+    prompt: str,
+    config: ReflexConfig,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> dict:
+    """Thinking fast-intuition: full reasoning allowed (no prefill).
+
+    The short tick decisions stay on ``judge()`` (non-thinking, prefill "{",
+    128 max_tokens, reasoning_tokens=0). Every OTHER small-model job — the
+    fast-intuition's actual reasoning work — goes through here with thinking
+    enabled. Returns {"text", "source", "latency_ms", "model"} or a
+    {"text": "", "source": "fallback", "failure"} on any failure. Never raises.
+    """
+    if not config.enabled:
+        return {"text": "", "source": "fallback", "failure": "reflex_disabled"}
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": _REFLECT_SYSTEM},
+            {"role": "user", "content": str(prompt or "")},
+        ],
+        "max_tokens": DEFAULT_REFLECT_MAX_TOKENS,
+        "temperature": 1.0,
+        "stream": False,
+    }
+    started = time.perf_counter()
+    try:
+        if client is not None:
+            resp = await client.post(
+                config.url.rstrip("/") + REFLEX_ENDPOINT,
+                json=payload,
+                headers=_auth_headers(config.api_key),
+            )
+        else:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(DEFAULT_REFLECT_TIMEOUT_S),
+                transport=transport,
+                trust_env=False,
+            ) as http:
+                resp = await http.post(
+                    config.url.rstrip("/") + REFLEX_ENDPOINT,
+                    json=payload,
+                    headers=_auth_headers(config.api_key),
+                )
+        resp.raise_for_status()
+        data = resp.json()
+        text = str(data["choices"][0]["message"].get("content") or "").strip()
+        return {
+            "text": text,
+            "source": "reflex-think",
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "model": config.model,
+        }
+    except Exception as exc:
+        logger.debug("reflect fallback", exc_info=True)
+        return {
+            "text": "",
+            "source": "fallback",
+            "failure": f"error:{type(exc).__name__}",
+        }
+
+
 __all__ = [
     "ACTIONS",
+    "DEFAULT_REFLECT_MAX_TOKENS",
+    "DEFAULT_REFLECT_TIMEOUT_S",
     "DEFAULT_REFLEX_MAX_TOKENS",
     "DEFAULT_REFLEX_MODEL",
     "DEFAULT_REFLEX_PREFILL",
@@ -542,4 +645,5 @@ __all__ = [
     "build_user_prompt",
     "judge",
     "load_reflex_config",
+    "reflect",
 ]
