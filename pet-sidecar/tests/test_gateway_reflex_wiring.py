@@ -832,6 +832,30 @@ def test_reflex_quiet_publishes_reflex_decision_to_brain(life, monkeypatch, tmp_
     assert meta.get("confidence") is None
 
 
+def test_reflex_fallback_is_labelled_distinctly(life, monkeypatch, tmp_path):
+    """小模型没答上时必须一眼看出：来源标 reflex·回落，而不是 reflex。
+
+    生产环境曾出现"每拍都超时回落"，面板却显示 来源 reflex——看起来像
+    小模型在决策，实际它一个字都没答。
+    """
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    _arm(monkeypatch, {
+        "action": "quiet", "think": False, "next_check_s": 300,
+        "reason": "", "source": "fallback", "failure": "timeout",
+    })
+    provider = _RecordingOpenAI([[
+        {"type": "delta", "content": "不该出现"},
+        {"type": "end"},
+    ]])
+    _install(monkeypatch, provider, passive=_passive(action="speak"))
+    _run(provider, _req(messages=_PROACTIVE))
+    d_events = [e for e in brain_mod.snapshot() if e["type"] == "d_decision"]
+    assert len(d_events) == 1
+    assert d_events[0]["meta"]["source"] == "reflex·回落"
+
+
 # ── 11. Model-decided time sense: closed loop across ticks ──────────
 
 

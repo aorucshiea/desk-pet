@@ -2743,9 +2743,17 @@ if (window.pet) {
   if (window.pet.onUpdateApplying) window.pet.onUpdateApplying(showUpdateProgress);
   if (window.pet.onNarrate) window.pet.onNarrate(showNarration);
   // 身体感受: the body reported touch (drag / click burst) → wake the
-  // pet immediately so it reacts while the sensation is fresh.
+  // pet immediately so it reacts while the sensation is fresh. When the
+  // gateway already produced a cheap fast-intuition reaction line, show
+  // that instead: it is one sentence, ready in seconds, and costs the
+  // intuition lane instead of a whole main-brain round.
   if (window.pet.onPetTouched) window.pet.onPetTouched(() => {
     void submitTouchWake();
+  });
+  if (window.pet.onPetReaction) window.pet.onPetReaction((p) => {
+    const text = p && typeof p.text === "string" ? p.text.trim() : "";
+    if (!text) return;
+    void showNarration({ text, kind: "Touch" });
   });
   // Proactive policy from settings: "off" / "free" / "interval:<seconds>"
   if (window.pet.onProactivePolicy) {

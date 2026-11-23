@@ -651,6 +651,10 @@ _last_vitals_sleep: Optional[bool] = None
 # Task 只被弱引用持有，事件循环空转时可能被 GC，协程就悄无声息地不再执行。
 _BOOT_TASKS: "set" = set()
 
+# 触摸反应词的节流闩：一次抚摸/连戳只出一句，别把身体变成话痨。
+_TOUCH_REACTION_STATE: dict = {"last_at": 0.0}
+_TOUCH_REACTION_MIN_GAP_S = 15.0
+
 # 记忆整理轮（点 7）：audit 只保留核心记忆工具；recap 一个工具都不给。
 _ORGANIZE_AUDIT_TOOLS = {"memory", "recall", "memory_search"}
 _ORGANIZE_PROMPTS = {
@@ -3149,6 +3153,64 @@ def build_app(
     global _extraction_hook
     _extraction_hook = _apply_extraction
 
+    # ── 摸头/戳 的反应词：快直觉（思考档）写一句，壳直接显示 ───────────
+    # 以前每次 touch 都唤醒整颗主脑写"嗷"——贵、慢、还要等 20 秒首字。
+    # 反应词是典型的"其余工作"：有判断（撒娇/打招呼/不耐烦）但只出一句，
+    # 所以走小模型的思考档（reflect 同款），并把代价记在直觉账上。
+    async def _maybe_touch_reaction(detail: Optional[str]) -> str:
+        if not detail:
+            return ""
+        cfg = _reflex_config_ref.get("cfg")
+        if cfg is None or not bool(cfg.enabled):
+            return ""
+        # 睡着/停机/死亡时不拿廉价反应词去吵醒身体：睡眠有自己的吵醒阶梯。
+        vitals = get_vitals()
+        if vitals is not None and (
+            bool(vitals.forced_off) or bool(vitals.died) or vitals.is_asleep()
+        ):
+            return ""
+        now = time.time()
+        if now - float(_TOUCH_REACTION_STATE.get("last_at") or 0.0) < _TOUCH_REACTION_MIN_GAP_S:
+            return ""
+        try:
+            mood_idx = float(mood_store.emotion_index) if mood_store is not None else 0.0
+        except (TypeError, ValueError):
+            mood_idx = 0.0
+        thoughts: list = []
+        try:
+            lg = get_ledger()
+            if lg is not None:
+                thoughts = [
+                    str(e.get("text") or "").strip()
+                    for e in lg.entries()
+                    if e.get("kind") == "fast"
+                ][-2:]
+        except Exception:
+            thoughts = []
+        result = await _reflex_module.touch_reaction(
+            detail,
+            cfg,
+            mood=_mood_label_for_reflex(mood_idx),
+            thoughts=thoughts,
+        )
+        text = str(result.get("text") or "").strip()
+        if not text:
+            log.debug(
+                "touch reaction skipped: %s", result.get("failure") or "empty"
+            )
+            return ""
+        _TOUCH_REACTION_STATE["last_at"] = now
+        log.info(
+            "touch reaction: %r (lat=%sms model=%s)",
+            text, result.get("latency_ms"), result.get("model"),
+        )
+        try:
+            if vitals is not None:
+                vitals.drain_small(400)  # 直觉车道 ×0.5：约 200 单位
+        except Exception as exc:
+            _note_failure("touch_reaction_drain", exc)
+        return text
+
     @app.post("/api/pet/interaction")
     async def pet_interaction(payload: PetInteractionRequest):
         """身体感受上报: the pet BODY reports touch (drag / click burst).
@@ -3157,6 +3219,12 @@ def build_app(
         injected into the next chat's system prompt; meaningful ones also
         become light episodic events (throttled per kind so a gesture
         storm can't flood the memory stream).
+
+        The response optionally carries a `reaction`: one short line written
+        by the fast-intuition small model in thinking mode (the cheap path
+        the shell uses instead of waking the whole main brain for "嗷").
+        Empty string means "no cheap line" — the shell then falls back to
+        its own touch-wake round.
         """
         detail, ev_title, ev_content = _organ_service("somatic", _somatic_module).record(
             _somatic_buffer, payload.model_dump()
@@ -3174,7 +3242,12 @@ def build_app(
                     )
             except Exception as exc:
                 log.warning("somatic event write failed: %s", exc)
-        return {"ok": True, "recorded": bool(detail)}
+        reaction = ""
+        try:
+            reaction = await _maybe_touch_reaction(detail)
+        except Exception as exc:  # a reaction must never break a touch report
+            log.debug("touch reaction failed: %s", exc)
+        return {"ok": True, "recorded": bool(detail), "reaction": reaction}
 
     @app.post("/api/events/extract")
     async def extract_events(payload: dict):
@@ -6731,7 +6804,13 @@ async def _stream_chat_provider(
             pass
         _decision["action"] = _rx_action
         _decision["action_label"] = _rx_action_label
-        _decision["source"] = "reflex"
+        # 来源要区分"小模型真的判了"和"小模型没答、走了安全回落"：前者是
+        # reflex，后者标 reflex·回落——否则面板显示"来源 reflex"而实际
+        # 每拍都在超时回落，看起来像小模型在决策，其实根本没答上。
+        _decision["source"] = (
+            "reflex" if _reflex_decision.get("source") == "reflex"
+            else "reflex·回落"
+        )
         # reflex 给的是离散判断，不是采样后验：不展示 D 的先验置信度。
         _decision["confidence"] = None
         _decision["reason"] = f"reflex|{_reflex_decision.get('reason') or ''}"

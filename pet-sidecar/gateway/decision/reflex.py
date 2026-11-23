@@ -55,7 +55,7 @@ import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import httpx
 
@@ -72,13 +72,14 @@ DEFAULT_REFLEX_PREFILL = "{"
 # Measured: with the prefill defeating the thinking phase reasoning_tokens=0,
 # so 128 completion tokens covers the whole JSON object with headroom.
 DEFAULT_REFLEX_MAX_TOKENS = 128
-# Measured p50 ~2.05 s, ~2.72 s under load; 4 s keeps the reflex off the
-# life-tick critical path while leaving tail room before the fallback.
-# Production observation (LM Studio also serving the main 35B model): a cold
-# JIT load plus a queued prefill routinely crossed 4.0 s, so EVERY tick fell
-# back to quiet and the small model never decided. 8 s still sits far below
-# the fastest tempo tier (50–70 s) but survives a cold load / short queue.
-DEFAULT_REFLEX_TIMEOUT_S = 8.0
+# Measured p50 ~2.05 s in a clean benchmark; IN PRODUCTION the same request
+# shape (system + state + prefill + strict json_schema, 128 tokens) measured
+# 7–11 s while the main 35B model shares the LM Studio box (CPU-only, both
+# models resident). The production measurement, not the benchmark, is what
+# matters: at 4 s / 8 s EVERY tick fell back to quiet and the small model
+# never decided. 20 s still fits the fastest tempo tier (50–70 s) and leaves
+# the fallback for a genuinely dead endpoint.
+DEFAULT_REFLEX_TIMEOUT_S = 20.0
 
 REFLEX_URL_ENV = "PET_REFLEX_URL"
 REFLEX_MODEL_ENV = "PET_REFLEX_MODEL"
@@ -565,6 +566,188 @@ _REFLECT_SYSTEM = (
     "正文，不要 JSON、不要解释自己的思考过程。"
 )
 
+# ── 摸头/戳 的反应词（快直觉的"其余工作"第一站）──────────────────────
+# 壳里的 touch wake 以前唤醒整颗主脑写一句反应，贵且慢。反应词是输出极短
+# 的活儿，所以走**短决策**配方（prefill + strict JSON，不思考）：实测
+# 1–3 s 出一句；同一需求走思考档要 18 s 而且经常把 256 token 全烧在推理上、
+# 正文为空。反应词的"判断"（撒娇/打招呼/不耐烦）交给这段非思考的直觉。
+TOUCH_REACTION_MAX_CHARS = 24
+TOUCH_REACTION_MAX_TOKENS = 64
+TOUCH_REACTION_TIMEOUT_S = 20.0
+
+_TOUCH_PREFILL = '{"reaction": "'
+_TOUCH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {"reaction": {"type": "string"}},
+    "required": ["reaction"],
+    "additionalProperties": False,
+}
+_TOUCH_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {"name": "touch_reaction", "strict": True, "schema": _TOUCH_SCHEMA},
+}
+
+_TOUCH_SYSTEM = (
+    "你是桌宠的快直觉（身体层）。用户（你的主人）刚刚碰了你的身体——是他在碰你，"
+    "不是你在碰他。用直觉判断这是撒娇、打招呼，还是不耐烦地戳，然后说出你此刻"
+    "**嘴里的一句话**。\n"
+    "要求：第一人称说话；不超过 20 个中文字；只写台词。\n"
+    "禁止：描写身体动作、表情、眼神、身体部位；不要引号；不要旁白；不要解释。\n"
+    "例：主人戳你 3 下（撒娇）→ 诶嘿，好痒～\n"
+    "例：主人戳你 7 下（不耐烦）→ 别戳啦，我在呢。\n"
+    "例：主人把你拎起来晃了晃（开心）→ 哇——放我下来啦。"
+)
+
+# 模型很容易退化成"叙述身体"（左侧躯体瞬间僵硬一下…）。那种句子不该进
+# 对话气泡：宁可不出声，交给壳的 touch wake 兜底。
+_NARRATION_MARKERS = (
+    "眼神", "表情", "身体", "躯体", "抬起头", "低下头", "歪头", "僵硬",
+    "颤抖", "缓缓", "瞬间", "耳朵", "尾巴", "眼眶", "嘴角",
+)
+
+_TOUCH_REACTION_RE = re.compile(r'"reaction"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def build_touch_prompt(
+    detail: str,
+    *,
+    mood: str = "",
+    thoughts: Optional[Sequence[str]] = None,
+) -> str:
+    """Compact Chinese prompt for one touch reaction (never a JSON dump)."""
+    lines = [f"身体感受：{str(detail or '').strip() or '（不确定）'}"]
+    mood_text = str(mood or "").strip()
+    if mood_text:
+        lines.append(f"当前心情：{mood_text}")
+    recent = [str(t).strip() for t in (thoughts or []) if str(t).strip()][:2]
+    if recent:
+        lines.append("最近在想：" + "；".join(recent))
+    lines.append("直接说一句反应，不要解释。")
+    return "\n".join(lines)
+
+
+_QUOTE_CHARS = "「」『』“”\"'‘’()（）[]【】"
+
+
+def clean_touch_reaction(text: Any) -> str:
+    """One short spoken line: strip quotes/brackets, first sentence, cap length."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    # 热模型爱把台词包在引号里，或先写"（身体反应）"再说话。
+    raw = raw.strip(_QUOTE_CHARS).strip()
+    # 只取第一句：句末标点之后的内容是对解释/旁白的空间。
+    for stop in ("。", "！", "？", "\n", "!", "?"):
+        cut = raw.find(stop)
+        if 0 < cut < len(raw) - 1:
+            raw += stop
+            raw = raw[: cut + 1]
+            break
+    raw = raw.strip(_QUOTE_CHARS).strip()
+    if len(raw) > TOUCH_REACTION_MAX_CHARS:
+        raw = raw[: TOUCH_REACTION_MAX_CHARS - 1].rstrip() + "…"
+    return raw
+
+
+def _parse_touch_content(content: Any) -> str:
+    """Tolerate a JSON continuation, an echoed full object, or bare prose."""
+    raw = str(content or "").strip()
+    if not raw:
+        return ""
+    candidates = [_TOUCH_PREFILL + raw]
+    if raw.startswith("{"):
+        candidates.insert(0, raw)
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("reaction"), str):
+            return data["reaction"]
+    match = _TOUCH_REACTION_RE.search(_TOUCH_PREFILL + raw)
+    if match:
+        try:
+            return json.loads('"' + match.group(1) + '"')
+        except Exception:
+            return match.group(1)
+    return raw
+
+
+async def touch_reaction(
+    detail: str,
+    config: ReflexConfig,
+    *,
+    mood: str = "",
+    thoughts: Optional[Sequence[str]] = None,
+    client: Optional[httpx.AsyncClient] = None,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> dict:
+    """One cheap reaction line for a body touch. Never raises.
+
+    Non-thinking prefill + strict JSON (the same lever as judge()): the line
+    is ready in ~1–3 s and the model cannot burn the budget on reasoning.
+    Returns {"text", "source": "reflex", "latency_ms", "model"} or
+    {"text": "", "source": "fallback", "failure"}.
+    """
+    if not config.enabled:
+        return {"text": "", "source": "fallback", "failure": "reflex_disabled"}
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": _TOUCH_SYSTEM},
+            {"role": "user", "content": build_touch_prompt(detail, mood=mood, thoughts=thoughts)},
+            # THE lever: continue straight into the JSON string.
+            {"role": "assistant", "content": _TOUCH_PREFILL},
+        ],
+        "response_format": _TOUCH_RESPONSE_FORMAT,
+        "max_tokens": TOUCH_REACTION_MAX_TOKENS,
+        "temperature": 1.0,
+    }
+    started = time.perf_counter()
+    try:
+        if client is not None:
+            resp = await client.post(
+                config.url.rstrip("/") + REFLEX_ENDPOINT,
+                json=payload,
+                headers=_auth_headers(config.api_key),
+            )
+        else:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(TOUCH_REACTION_TIMEOUT_S),
+                transport=transport,
+                trust_env=False,
+            ) as http:
+                resp = await http.post(
+                    config.url.rstrip("/") + REFLEX_ENDPOINT,
+                    json=payload,
+                    headers=_auth_headers(config.api_key),
+                )
+        resp.raise_for_status()
+        data = resp.json()
+        text = clean_touch_reaction(
+            _parse_touch_content(
+                data["choices"][0]["message"].get("content") or ""
+            )
+        )
+        if not text:
+            return {"text": "", "source": "fallback", "failure": "empty_text"}
+        if any(marker in text for marker in _NARRATION_MARKERS):
+            # 叙述身体的那种句子不进气泡（见 _NARRATION_MARKERS 注释）。
+            return {"text": "", "source": "fallback", "failure": "narration"}
+        return {
+            "text": text,
+            "source": "reflex",
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "model": config.model,
+        }
+    except Exception as exc:
+        logger.debug("touch_reaction fallback", exc_info=True)
+        return {
+            "text": "",
+            "source": "fallback",
+            "failure": f"error:{type(exc).__name__}",
+        }
+
 
 async def reflect(
     prompt: str,
@@ -697,11 +880,17 @@ __all__ = [
     "REFLEX_URL_ENV",
     "TEMPO_DEFAULT",
     "TEMPO_RANGE_S",
+    "TOUCH_REACTION_MAX_CHARS",
+    "TOUCH_REACTION_MAX_TOKENS",
+    "TOUCH_REACTION_TIMEOUT_S",
     "ReflexConfig",
     "adjust_config",
+    "build_touch_prompt",
     "build_user_prompt",
+    "clean_touch_reaction",
     "judge",
     "load_reflex_config",
     "prewarm",
     "reflect",
+    "touch_reaction",
 ]

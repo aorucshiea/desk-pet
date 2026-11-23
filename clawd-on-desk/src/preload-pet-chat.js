@@ -82,6 +82,10 @@ contextBridge.exposeInMainWorld("pet", {
   onPetTouched:     (cb) => ipcRenderer.on("pet:pet-touched",         (_e, p) => {
     try { cb(p || {}); } catch {}
   }),
+  // 身体感受: 快直觉已经写好一句廉价反应词 → 直接显示，不再唤醒主脑
+  onPetReaction:    (cb) => ipcRenderer.on("pet:pet-reaction",        (_e, p) => {
+    try { cb(p || {}); } catch {}
+  }),
   // 身体移动: the model walks itself ([WALK:dx,dy] / [WALK_DESKTOP])
   petWalk:          (dx, dy) => ipcRenderer.send("pet:pet-walk",        { dx: Number(dx) || 0, dy: Number(dy) || 0 }),
   petTurn:          (direction) => ipcRenderer.send("pet:pet-turn",     { direction: String(direction || "right") }),

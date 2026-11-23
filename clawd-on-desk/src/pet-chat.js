@@ -1970,8 +1970,12 @@ module.exports = function initDeskPetChat(ctx) {
   // ── 身体感受上报: the BODY tells the BRAIN about touch ──────────
   // Drag-end / click-burst reports go to the gateway, which keeps them
   // fresh for the next chat's system prompt and writes light episodic
-  // memories. Fire-and-forget: a failed report must NEVER break
-  // dragging or clicking — swallow everything.
+  // memories. The reply may also carry a `reaction` — one cheap line the
+  // fast-intuition small model wrote in thinking mode. That replaces the
+  // old "wake the whole main brain to say 嗷" path (expensive, ~20s first
+  // token); when no cheap line comes back, the renderer's touch wake still
+  // runs exactly as before. Fire-and-forget: a failed report must NEVER
+  // break dragging or clicking — swallow everything.
   function reportInteraction(payload) {
     try {
       const body = {
@@ -1981,21 +1985,27 @@ module.exports = function initDeskPetChat(ctx) {
         duration_ms: Number(payload && payload.duration_ms) || 0,
       };
       if (!body.kind) return;
-      void httpJson("POST", `${sidecar.baseUrl()}/api/pet/interaction`, body, 2500)
-        .catch(() => {});
-      // 碰他就直接告诉他: also push to the chat renderer so it can wake
-      // the pet immediately instead of waiting for the next idle window.
-      // The renderer owns all gating (mode / phase / cooldown). The
-      // bubble is lazy-created, so ensure it exists; if its page is still
-      // loading, deliver after load or the wake would be lost.
-      try {
-        const b = ensureBubble();
-        const push = () => {
-          try { b.webContents.send("pet:pet-touched", { kind: body.kind }); } catch {}
+      const bubble = (() => { try { return ensureBubble(); } catch { return null; } })();
+      const push = (channel, extra) => {
+        if (!bubble) return;
+        const send = () => {
+          try { bubble.webContents.send(channel, Object.assign({ kind: body.kind }, extra)); } catch {}
         };
-        if (b.webContents.isLoading()) b.webContents.once("did-finish-load", push);
-        else push();
-      } catch {}
+        try {
+          if (bubble.webContents.isLoading()) bubble.webContents.once("did-finish-load", send);
+          else send();
+        } catch {}
+      };
+      // 反应词可能要想一句话（远小于一轮主脑），给 20s 而不是 2.5s。
+      void httpJson("POST", `${sidecar.baseUrl()}/api/pet/interaction`, body, 20000)
+        .then((r) => {
+          const reaction = r && r.json && typeof r.json.reaction === "string"
+            ? r.json.reaction.trim()
+            : "";
+          if (reaction) push("pet:pet-reaction", { text: reaction });
+          else push("pet:pet-touched");
+        })
+        .catch(() => push("pet:pet-touched"));
     } catch {}
   }
 

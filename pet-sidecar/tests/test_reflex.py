@@ -94,7 +94,7 @@ def test_defaults_when_providers_json_missing(tmp_path):
     assert config.enabled is True
     assert config.prefill == "{"
     assert config.max_tokens == 128
-    assert config.timeout_s == pytest.approx(8.0)
+    assert config.timeout_s == pytest.approx(20.0)
     assert config.api_key == "lm-studio"
 
 
@@ -577,6 +577,124 @@ def test_user_prompt_caps_recent_thoughts_at_three():
     )
     assert "一；二；三" in prompt
     assert "四" not in prompt
+
+
+# ── 摸头/戳 的反应词（快直觉的"其余工作"走思考档）──────────────────
+
+
+def test_touch_prompt_is_compact_and_carries_sensation():
+    prompt = reflex.build_touch_prompt(
+        "用户戳了你 3 下", mood="开心", thoughts=["刚睡醒", "想着窗台", "更早的"]
+    )
+    assert "身体感受：用户戳了你 3 下" in prompt
+    assert "当前心情：开心" in prompt
+    # 只带最近 2 条心声（多了会让一句反应词变成读台账）
+    assert "刚睡醒；想着窗台" in prompt
+    assert "更早的" not in prompt
+    assert prompt.rstrip().endswith("直接说一句反应，不要解释。")
+    # 缺字段也不炸
+    bare = reflex.build_touch_prompt("")
+    assert "身体感受：（不确定）" in bare
+    assert "当前心情" not in bare
+
+
+def test_clean_touch_reaction_strips_quotes_and_keeps_first_sentence():
+    assert reflex.clean_touch_reaction("「嗷！」") == "嗷！"
+    assert reflex.clean_touch_reaction("嗯……别戳了。后面还有解释") == "嗯……别戳了。"
+    assert reflex.clean_touch_reaction("（歪头）") == "歪头"
+    assert reflex.clean_touch_reaction("") == ""
+    long_text = "痒" * 60
+    cleaned = reflex.clean_touch_reaction(long_text)
+    assert len(cleaned) <= reflex.TOUCH_REACTION_MAX_CHARS
+    assert cleaned.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_touch_reaction_uses_short_decision_recipe():
+    """反应词是"短决策"：prefill + strict JSON，不思考——1~3 秒出一句。
+
+    曾经走过思考档（reflect 同款）：同一条需求 18 秒，还把 256 token 全烧
+    在推理上、正文为空——反应词永远出不来。
+    """
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant",
+                                     "content": "好痒～\"}"}}]
+        })
+
+    out = await reflex.touch_reaction(
+        "用户戳了你 3 下", _config(), mood="开心",
+        transport=httpx.MockTransport(handler),
+    )
+    assert out["text"] == "好痒～"
+    assert out["source"] == "reflex"
+    body = seen["body"]
+    # 短决策配方：assistant prefill + strict json_schema，小 max_tokens
+    assert body["messages"][-1]["role"] == "assistant"
+    assert body["messages"][-1]["content"] == reflex._TOUCH_PREFILL
+    assert body["response_format"]["type"] == "json_schema"
+    assert body["max_tokens"] == reflex.TOUCH_REACTION_MAX_TOKENS
+    assert reflex.TOUCH_REACTION_MAX_TOKENS <= 96
+
+
+def test_parse_touch_content_tolerates_three_shapes():
+    # 1) 正常 continuation（prefill 补回后是合法 JSON）
+    assert reflex._parse_touch_content('嗯～"}') == "嗯～"
+    # 2) 模型把整个对象都吐出来
+    assert reflex._parse_touch_content('{"reaction": "别戳"}') == "别戳"
+    # 3) 完全跑偏的散文：不炸，退化成原文（清理阶段再截断）
+    assert reflex._parse_touch_content("好痒") == "好痒"
+
+
+@pytest.mark.asyncio
+async def test_touch_reaction_rejects_body_narration():
+    """模型退化成叙述身体时不出声——那种句子不该进对话气泡。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant",
+                                     "content": "左侧躯体瞬间僵硬一下，然后抬起头\"}"}}]
+        })
+
+    out = await reflex.touch_reaction(
+        "用户戳了你 3 下", _config(), transport=httpx.MockTransport(handler)
+    )
+    assert out["text"] == ""
+    assert out["failure"] == "narration"
+
+
+@pytest.mark.asyncio
+async def test_touch_reaction_disabled_and_failure_never_raise():
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down", request=request)
+
+    disabled = await reflex.touch_reaction(
+        "用户戳了你 1 下", _config(enabled=False),
+        transport=httpx.MockTransport(boom),
+    )
+    assert disabled["text"] == "" and disabled["source"] == "fallback"
+
+    failed = await reflex.touch_reaction(
+        "用户戳了你 1 下", _config(), transport=httpx.MockTransport(boom)
+    )
+    assert failed["text"] == "" and failed["source"] == "fallback"
+    assert failed["failure"].startswith("error:")
+
+
+@pytest.mark.asyncio
+async def test_touch_reaction_empty_content_is_a_fallback():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "   "}}]
+        })
+
+    out = await reflex.touch_reaction(
+        "用户戳了你 1 下", _config(), transport=httpx.MockTransport(handler)
+    )
+    assert out["source"] == "fallback" and out["failure"] == "empty_text"
 
 
 # ── 预热（冷加载才是每拍回落的真凶）────────────────────────────────────
