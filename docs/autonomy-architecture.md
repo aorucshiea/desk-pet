@@ -137,6 +137,8 @@ AI 自主决定睡眠 ≥4 小时；系统强制 = 8 小时。睡眠中只有说
 
 **生产实测**：LM Studio 与主脑 35B 共用一台 CPU 机器时，同一条 tick 请求 7–25 s（基准机上 p50 2.05 s）。所以 `DEFAULT_REFLEX_TIMEOUT_S = 25`，并在 lifespan 里做一次 `prewarm()` 顶掉冷加载——否则每拍都超时回落，小模型等于没上过岗。真正的提速要把主脑让出 LM Studio（或换云端 provider）。
 
+**每轮视锥同帧**（2026-11-24）：授权 always 时每轮开头只截一次视锥（`server._capture_round_frame`，无几何时降级整屏缩放），快直觉与升级后的主脑读**同一张 b64**——一轮一帧是硬约束，不重拍、不变体。小模型收图由 `ReflexConfig.vision` 决定：模型名含 vl/vision/omni/-v- 自动开启（如 lfm3-vl-2b），providers.json `reflex.vision` 或 env `PET_REFLEX_VISION` 显式覆盖；纯文本小模型绝不收图，帧只交给主脑。授权 deny = 闭眼，`once` 不被自动帧消费。校准写死在 system prompt：平凡画面当没看见，只有明显值得反应的东西才升级。
+
 ## 尚缺的器官（路线图）
 
 1. **自主稳态的「决策」半边**（B-15）：主动自检已落地——每 5 分钟探测 llama 存活与 ClawdBridge 可达性，连续 3 次异常进入 `degraded`，并把「生病了 / 病好了」写进事件记忆与遥测；bridge 用「连续失败阈值 + 最近成功窗口」判定，standalone 网关不会被误报。仍缺：根据 degraded 自动切 provider、进入安静模式等降级动作，也未做真机长时间验证。
