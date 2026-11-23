@@ -287,6 +287,7 @@ def build_user_prompt(state: Mapping[str, Any], tier: str) -> str:
             break
     lines = [
         f"状态：{summary}",
+        f"当前时间：{str(state.get('current_time') or '').strip() or '（未知）'}",
         f"节奏：{tier}（next_check_s 取 {lo}–{hi} 秒）",
         f"用户新消息：{_as_int(state.get('new_events'))} 条",
         f"用户在场：{'是' if state.get('user_present') else '否'}",

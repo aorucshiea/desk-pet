@@ -6582,6 +6582,7 @@ async def _stream_chat_provider(
             "mood": _mood_label_for_reflex(_rx_mood_idx),
             "recent_thoughts": _rx_thoughts,
             "d_action": str(_decision.get("action") or "quiet"),
+            "current_time": datetime.now().strftime("%H:%M"),
         }
         _rx_started = time.perf_counter()
         _reflex_decision = await _reflex_module.judge(
