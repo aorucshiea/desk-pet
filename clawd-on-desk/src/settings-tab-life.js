@@ -283,6 +283,269 @@
     } catch (e) { return false; }
   }
 
+  // ── 直觉模型配置卡（快直觉 / reflex）──────────────────────────────
+  var reflexState = {
+    baseUrl: "http://127.0.0.1:1234/v1",
+    model: "lfm3-1.7b",
+    apiKey: "lm-studio",
+    enabled: true,
+  };
+  var reflexInputs = null;
+
+  function toastReflex(msg, isError) {
+    try {
+      if (helpers && typeof helpers.toast === "function") {
+        helpers.toast(msg, !!isError);
+      } else {
+        console.log("[reflex]", msg);
+      }
+    } catch (e) { console.log("[reflex]", msg); }
+  }
+
+  function readReflexInputs() {
+    if (!reflexInputs) return { ...reflexState };
+    var model = reflexState.model;
+    if (reflexInputs.modelSelect) {
+      var v = reflexInputs.modelSelect.value;
+      if (v === "__custom__") {
+        // 手动输入模式：弹出 prompt 让用户输入
+        var custom = window.prompt("输入模型名称", reflexState.model);
+        if (custom) model = custom.trim();
+      } else if (v) {
+        model = v;
+      }
+    }
+    return {
+      baseUrl: (reflexInputs.baseUrl.value || "").trim() || "http://127.0.0.1:1234/v1",
+      model: model || "lfm3-1.7b",
+      apiKey: (reflexInputs.apiKey.value || "").trim() || "lm-studio",
+      enabled: !!reflexInputs.enabled.checked,
+    };
+  }
+
+  function applyReflexState(cfg) {
+    if (!cfg) return;
+    reflexState = {
+      baseUrl: cfg.baseUrl || reflexState.baseUrl,
+      model: cfg.model || reflexState.model,
+      apiKey: cfg.apiKey || reflexState.apiKey,
+      enabled: cfg.enabled !== false,
+    };
+    if (reflexInputs) {
+      if (reflexInputs.baseUrl) reflexInputs.baseUrl.value = reflexState.baseUrl;
+      if (reflexInputs.modelSelect && reflexInputs.modelSelect.options) {
+        // 如果当前模型不在选项中，先添加它
+        var found = false;
+        for (var i = 0; i < reflexInputs.modelSelect.options.length; i++) {
+          if (reflexInputs.modelSelect.options[i].value === reflexState.model) {
+            found = true;
+            break;
+          }
+        }
+        if (!found && reflexState.model) {
+          var opt = el("option", { value: reflexState.model }, reflexState.model);
+          reflexInputs.modelSelect.insertBefore(opt, reflexInputs.modelSelect.firstChild);
+        }
+        reflexInputs.modelSelect.value = reflexState.model;
+      }
+      if (reflexInputs.apiKey) reflexInputs.apiKey.value = reflexState.apiKey;
+      if (reflexInputs.enabled) reflexInputs.enabled.checked = reflexState.enabled;
+    }
+  }
+
+  async function loadReflexConfig() {
+    try {
+      if (window.petSettings && typeof window.petSettings.getReflexConfig === "function") {
+        var res = await window.petSettings.getReflexConfig();
+        if (res && res.ok && res.config) applyReflexState(res.config);
+      }
+    } catch (e) { console.warn("reflex: load failed", e); }
+  }
+
+  async function saveReflexConfig() {
+    var cfg = readReflexInputs();
+    try {
+      if (window.petSettings && typeof window.petSettings.saveReflexConfig === "function") {
+        var res = await window.petSettings.saveReflexConfig(cfg);
+        if (res && res.ok) {
+          applyReflexState(cfg);
+          toastReflex("直觉模型配置已保存" + (res.reloaded ? "（网关已热重载）" : "（重启网关后生效）"), false);
+        } else {
+          toastReflex("保存失败: " + ((res && res.error) || "unknown"), true);
+        }
+      }
+    } catch (e) {
+      toastReflex("保存失败: " + String(e && e.message || e), true);
+    }
+  }
+
+  function inputRow(labelText, key, placeholder) {
+    var row = el("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: "10px",
+        marginBottom: "10px",
+        fontSize: "13px",
+      },
+    });
+    row.appendChild(el("span", {
+      style: { minWidth: "72px", color: "var(--text-secondary, #9aa4b2)" },
+    }, labelText));
+    var input = el("input", {
+      type: "text",
+      placeholder: placeholder || "",
+      style: {
+        flex: "1",
+        padding: "6px 10px",
+        borderRadius: "6px",
+        border: "1px solid var(--border, rgba(255,255,255,0.18))",
+        background: "var(--bg-secondary, rgba(255,255,255,0.05))",
+        color: "var(--text-primary, #fff)",
+        fontSize: "13px",
+      },
+    });
+    row.appendChild(input);
+    return { row: row, input: input };
+  }
+
+  // 从 LM Studio 拉取可用模型列表（通过主进程 IPC，避免 CSP 限制）
+  async function fetchLmStudioModels(baseUrl) {
+    try {
+      if (window.petSettings && typeof window.petSettings.getLmStudioModels === "function") {
+        var res = await window.petSettings.getLmStudioModels(baseUrl);
+        if (res && res.ok && Array.isArray(res.models)) {
+          return res.models;
+        }
+      }
+    } catch (e) { /* 静默失败 */ }
+    return [];
+  }
+
+  function modelSelectRow(labelText) {
+    var row = el("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: "10px",
+        marginBottom: "10px",
+        fontSize: "13px",
+      },
+    });
+    row.appendChild(el("span", {
+      style: { minWidth: "72px", color: "var(--text-secondary, #9aa4b2)" },
+    }, labelText));
+    var select = el("select", {
+      style: {
+        flex: "1",
+        padding: "6px 10px",
+        borderRadius: "6px",
+        border: "1px solid var(--border, rgba(255,255,255,0.18))",
+        background: "var(--bg-secondary, rgba(255,255,255,0.05))",
+        color: "var(--text-primary, #fff)",
+        fontSize: "13px",
+      },
+    });
+    row.appendChild(select);
+    var refreshBtn = el("button", {
+      type: "button",
+      className: "soft-btn",
+      style: { padding: "4px 10px", fontSize: "12px" },
+      onClick: function () { void refreshModelList(); },
+    }, "刷新");
+    row.appendChild(refreshBtn);
+    return { row: row, select: select, refreshBtn: refreshBtn };
+  }
+
+  async function refreshModelList() {
+    if (!reflexInputs) return;
+    var baseUrl = (reflexInputs.baseUrl.value || "").trim();
+    if (!baseUrl) return;
+    var models = await fetchLmStudioModels(baseUrl);
+    var select = reflexInputs.modelSelect;
+    if (!select) return;
+    // 保留当前选中值
+    var current = select.value || reflexState.model;
+    select.innerHTML = "";
+    // 添加当前模型（即使不在列表中）
+    if (current) {
+      var opt = el("option", { value: current }, current);
+      select.appendChild(opt);
+    }
+    // 添加 LM Studio 模型
+    models.forEach(function (m) {
+      if (m !== current) {
+        select.appendChild(el("option", { value: m }, m));
+      }
+    });
+    // 添加手动输入选项
+    select.appendChild(el("option", { value: "__custom__" }, "（手动输入…）"));
+    select.value = current;
+    if (models.length > 0) {
+      toastReflex("已加载 " + models.length + " 个模型", false);
+    } else {
+      toastReflex("未获取到模型列表（LM Studio 未启动？）", true);
+    }
+  }
+
+  function buildReflexCard() {
+    var card = el("div", { className: "life-card", style: { marginTop: "14px" } });
+    var head = el("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        marginBottom: "12px",
+      },
+    });
+    head.appendChild(el("div", { className: "life-section-title" }, "直觉模型（快直觉）"));
+    var enableLabel = el("label", {
+      style: { display: "flex", alignItems: "center", gap: "6px", fontSize: "13px", cursor: "pointer" },
+    });
+    var enableCheck = el("input", { type: "checkbox" });
+    enableLabel.appendChild(enableCheck);
+    enableLabel.appendChild(document.createTextNode("启用"));
+    head.appendChild(enableLabel);
+    card.appendChild(head);
+
+    card.appendChild(el("div", {
+      style: { fontSize: "12px", color: "var(--text-tertiary, #7d8590)", marginBottom: "12px", lineHeight: "1.6" },
+    }, "每次主动 tick 先由这个小模型判断要不要唤醒主脑。安静时主脑零调用，省钱；只有值得思考时才醒来。"));
+
+    var urlRow = inputRow("Base URL", "baseUrl", "http://127.0.0.1:1234/v1");
+    var modelRow = modelSelectRow("模型");
+    var keyRow = inputRow("API Key", "apiKey", "lm-studio（本地可留空）");
+    card.appendChild(urlRow.row);
+    card.appendChild(modelRow.row);
+    card.appendChild(keyRow.row);
+
+    var btnRow = el("div", { style: { display: "flex", gap: "10px", marginTop: "12px" } });
+    var saveBtn = el("button", {
+      type: "button",
+      className: "soft-btn",
+      onClick: function () { void saveReflexConfig(); },
+    }, "保存配置");
+    btnRow.appendChild(saveBtn);
+    var testBtn = el("button", {
+      type: "button",
+      className: "soft-btn",
+      onClick: function () {
+        toastReflex("当前模型: " + readReflexInputs().model + " @ " + readReflexInputs().baseUrl, false);
+      },
+    }, "查看当前");
+    btnRow.appendChild(testBtn);
+    card.appendChild(btnRow);
+
+    reflexInputs = {
+      baseUrl: urlRow.input,
+      modelSelect: modelRow.select,
+      apiKey: keyRow.input,
+      enabled: enableCheck,
+    };
+    applyReflexState(reflexState);
+    return card;
+  }
+
   function render(parent) {
     mounted = true;
     if (timer) { clearInterval(timer); timer = null; }
@@ -310,10 +573,13 @@
     card.appendChild(bodyHost);
     parent.appendChild(card);
 
+    parent.appendChild(buildReflexCard());
+
     parent.appendChild(el("div", { className: "life-footnote" }, t("lifeFooterNote")));
 
     refs = { bodyHost: bodyHost };
     void refresh();
+    void loadReflexConfig().then(function () { void refreshModelList(); });
     timer = setInterval(function () {
       if (!mounted || hiddenNow()) return;
       void refresh();

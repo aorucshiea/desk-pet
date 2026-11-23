@@ -2945,7 +2945,19 @@ module.exports = function initDeskPetChat(ctx) {
           // otherwise every settings save wipes what the user curated.
           if (Array.isArray(item.models)) map[item.provider].models = item.models;
         }
-        fs.writeFileSync(p, JSON.stringify({ providers: map }, null, 2), "utf-8");
+        // Preserve top-level fields outside `providers` (e.g. the `reflex`
+        // block for the intuition model) — a settings save must not wipe
+        // the user's reflex configuration.
+        let topLevel = {};
+        try {
+          const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+          if (existing && typeof existing === "object") {
+            for (const key of Object.keys(existing)) {
+              if (key !== "providers") topLevel[key] = existing[key];
+            }
+          }
+        } catch {}
+        fs.writeFileSync(p, JSON.stringify({ ...topLevel, providers: map }, null, 2), "utf-8");
         // Hot-reload the gateway's provider registry instead of restarting
         // the whole sidecar: a restart taskkills the process tree, which
         // guillotines any chat in flight (the captain's "让AI想想然后AI
@@ -2964,6 +2976,78 @@ module.exports = function initDeskPetChat(ctx) {
         } catch {}
         return { ok: true, reloaded };
       } catch (e) { return { ok: false, error: String(e.message || e) }; }
+    },
+    "pet:get-reflex-config": async () => {
+      const p = path.join(os.homedir(), ".pet", "providers.json");
+      try {
+        const data = JSON.parse(fs.readFileSync(p, "utf-8"));
+        const reflex = (data && data.reflex) || {};
+        return {
+          ok: true,
+          config: {
+            baseUrl: reflex.baseUrl || "http://127.0.0.1:1234/v1",
+            model: reflex.model || "lfm3-1.7b",
+            apiKey: reflex.apiKey || "lm-studio",
+            enabled: reflex.enabled !== false,
+          },
+        };
+      } catch (e) {
+        return {
+          ok: true,
+          config: {
+            baseUrl: "http://127.0.0.1:1234/v1",
+            model: "lfm3-1.7b",
+            apiKey: "lm-studio",
+            enabled: true,
+          },
+        };
+      }
+    },
+    "pet:save-reflex-config": async (_evt, { config } = {}) => {
+      if (!config) return { ok: false, error: "invalid config" };
+      const p = path.join(os.homedir(), ".pet", "providers.json");
+      try {
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        let data = {};
+        try {
+          data = JSON.parse(fs.readFileSync(p, "utf-8"));
+        } catch {}
+        data.reflex = {
+          baseUrl: String(config.baseUrl || "http://127.0.0.1:1234/v1").trim(),
+          model: String(config.model || "lfm3-1.7b").trim(),
+          apiKey: String(config.apiKey || "lm-studio").trim(),
+          enabled: config.enabled !== false,
+        };
+        fs.writeFileSync(p, JSON.stringify(data, null, 2), "utf-8");
+        // Hot-reload the gateway's provider registry so the new reflex
+        // config takes effect without restarting the sidecar.
+        let reloaded = false;
+        try {
+          const token = fs
+            .readFileSync(path.join(os.homedir(), ".pet", "gateway-token"), "utf8")
+            .trim();
+          const r = await fetch(`${sidecar.baseUrl()}/api/providers/reload`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-pet-token": token },
+          });
+          reloaded = !!(r && r.ok);
+        } catch {}
+        return { ok: true, reloaded };
+      } catch (e) { return { ok: false, error: String(e.message || e) }; }
+    },
+    "pet:get-lmstudio-models": async (_evt, { baseUrl } = {}) => {
+      const url = String(baseUrl || "").replace(/\/+$/, "") + "/models";
+      try {
+        const r = await fetch(url, { headers: { Accept: "application/json" } });
+        if (!r.ok) return { ok: false, models: [] };
+        const data = await r.json();
+        const models = Array.isArray(data?.data)
+          ? data.data.map((m) => m.id).filter(Boolean)
+          : [];
+        return { ok: true, models };
+      } catch (e) {
+        return { ok: false, models: [], error: String(e.message || e) };
+      }
     },
     "pet:get-provider-prefs": async () => {
       const snapshot = typeof ctx.getSettingsSnapshot === "function" ? ctx.getSettingsSnapshot() : {};

@@ -239,6 +239,9 @@ contextBridge.exposeInMainWorld("petSettings", {
   getHistoryFile: () => ipcRenderer.invoke("pet-settings:get-history-file"),
   clearChatHistory: () => ipcRenderer.invoke("pet:clear-chat-history"),
   saveProvidersConfig: (providers) => ipcRenderer.invoke("pet:save-providers-config", { providers }),
+  getReflexConfig: () => ipcRenderer.invoke("pet:get-reflex-config"),
+  saveReflexConfig: (config) => ipcRenderer.invoke("pet:save-reflex-config", { config }),
+  getLmStudioModels: (baseUrl) => ipcRenderer.invoke("pet:get-lmstudio-models", { baseUrl }),
   mcpGetConfig: () => ipcRenderer.invoke("pet:mcp-get-config"),
   mcpSaveConfig: (servers) => ipcRenderer.invoke("pet:mcp-save-config", { servers }),
   // Optional DeepSeek web-chat bridge.
