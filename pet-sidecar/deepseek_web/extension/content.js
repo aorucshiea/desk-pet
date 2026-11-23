@@ -2,8 +2,8 @@
 (() => {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   document.documentElement.setAttribute("data-ds-bridge", "1");
-  document.documentElement.setAttribute("data-ds-bridge-version", "0.4.2");
-  console.log("[DeepSeekBridge] content script loaded v0.4.2");
+  document.documentElement.setAttribute("data-ds-bridge-version", "0.4.4");
+  console.log("[DeepSeekBridge] content script loaded v0.4.3");
 
   function visible(el) {
     if (!el) return false;
@@ -131,9 +131,23 @@
     return null;
   }
 
+  function conversationKey() {
+    const m = location.pathname.match(/\/a\/chat\/s\/([^/?#]+)/);
+    return m ? m[1] : location.href;
+  }
+
+  function readBaseKey() {
+    try { return sessionStorage.getItem("dsBridgeBase") || ""; } catch { return ""; }
+  }
+
+  function rememberBaseKey() {
+    try { sessionStorage.setItem("dsBridgeBase", conversationKey()); } catch {}
+  }
+
   async function maybeNewChat() {
     const button = findNewChat();
-    if (!button) return;
+    const hadMessages = !!document.querySelector(".ds-markdown");
+    if (!button) return !hadMessages;
     const before = location.href;
     button.click();
     // SPA routing takes a moment; a fixed 700ms sometimes left the old
@@ -141,10 +155,14 @@
     const started = Date.now();
     while (Date.now() - started < 2500) {
       await sleep(100);
-      if (location.href !== before) break;
-      if (!document.querySelector(".ds-markdown")) break;
+      if (location.href !== before) return true;
+      if (!document.querySelector(".ds-markdown")) return true;
     }
     await sleep(300);
+    // A full prompt is only allowed in a genuinely fresh chat: appending it
+    // to the old transcript is what made the same 【系统设定】 block repeat
+    // in one DeepSeek conversation.
+    return !document.querySelector(".ds-markdown") || location.href !== before;
   }
 
   async function waitForReply(baseline) {
@@ -405,7 +423,15 @@
         throw new Error("DeepSeek 页面未登录");
       }
       if (job.new_chat !== false) {
-        await maybeNewChat();
+        if (!await maybeNewChat()) {
+          throw new Error("无法新建对话：拒绝把完整系统设定重复写进当前会话");
+        }
+      } else if (readBaseKey() !== conversationKey()) {
+        // Delta turns are only valid in the exact conversation that received
+        // the full system prompt. A manual new chat, a Chrome restart or a
+        // page refresh otherwise sends the model user text without tools,
+        // and it starts *describing* tool calls instead of emitting them.
+        throw new Error("网页会话缺少完整提示词（可能新建/刷新过），需要重新建立会话");
       }
       let input = findInput();
       if (!input) throw new Error("找不到输入框（页面可能改版）");
@@ -442,6 +468,9 @@
       // just read: history loaded from before a content-script reload can
       // still contain MEM/INNER text that the user should never see.
       sanitizeExisting();
+      if (job.new_chat !== false || promptText.includes("【系统设定】")) {
+        rememberBaseKey();
+      }
       chrome.runtime.sendMessage({ type: "result", id, text, error: "", page: location.href });
     } catch (err) {
       chrome.runtime.sendMessage({
@@ -457,7 +486,7 @@
   let running = false;
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg && msg.type === "ping") {
-      sendResponse({ ok: true, version: "0.4.2", running });
+      sendResponse({ ok: true, version: "0.4.4", running });
       return;
     }
     if (!msg || msg.type !== "run-job" || running) return;

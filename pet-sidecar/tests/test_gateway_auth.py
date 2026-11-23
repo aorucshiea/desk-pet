@@ -72,7 +72,18 @@ def test_gate_uses_constant_time_comparison():
     import hmac
     import inspect
 
-    source = inspect.getsource(server_mod.build_app)
-    assert "hmac.compare_digest" in source, (
+    # The token gate lives in the `_token_gate` HTTP middleware (a closure
+    # created inside build_app, registered via add_middleware). Inspect the
+    # dispatch function that actually performs the comparison; also accept
+    # build_app's own source so the probe keeps working if the gate is ever
+    # inlined back into build_app's body.
+    dispatch_fns = []
+    for mw in getattr(server_mod.build_app(initial_model=None), "user_middleware", []):
+        fn = (getattr(mw, "kwargs", None) or {}).get("dispatch")
+        if fn is not None:
+            dispatch_fns.append(fn)
+    sources = [inspect.getsource(fn) for fn in dispatch_fns]
+    sources.append(inspect.getsource(server_mod.build_app))
+    assert any("hmac.compare_digest" in s for s in sources), (
         "the token check went back to a plain != — audit V-6")
     assert callable(hmac.compare_digest)

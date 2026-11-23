@@ -111,11 +111,11 @@ def test_window_view_behind_is_not_visible():
     assert v["in_view"] is False
 
 
-def test_window_view_far_edge_out_of_range():
-    # 视线方向正确但最近边 450px > 400 视距
+def test_window_view_far_edge_stays_visible_to_screen_edge():
+    # 视锥延伸到屏幕边缘：450px 外、方向正确 → 仍然看得见
     v = _window_view(WPET, {"left": 1100, "top": 850, "right": 1400, "bottom": 870}, "right")
     assert v["dist"] == 450.0
-    assert v["in_view"] is False
+    assert v["in_view"] is True
 
 
 def test_window_view_overlapping_window_is_in_view():

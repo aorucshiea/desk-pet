@@ -26,7 +26,7 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator, List, Optional, Union
+from typing import Any, AsyncGenerator, List, Optional, Union
 
 import httpx
 
@@ -72,11 +72,44 @@ from . import telemetry
 from . import brain as _brain
 from .decision import sampler as _decision_sampler
 
+
+def _sanitize_no_proxy_env() -> None:
+    """Normalize bracketed IPv6 entries in NO_PROXY.
+
+    ``NO_PROXY=...,[::1],...`` is a valid shell form but httpx's URL parser
+    raises InvalidURL on it, killing the gateway at boot when it builds the
+    ClawdBridge client. Strip only the brackets; leave every other entry.
+    """
+    for key in ("NO_PROXY", "no_proxy"):
+        raw = os.environ.get(key)
+        if not raw or "[" not in raw:
+            continue
+        parts: list[str] = []
+        for part in raw.split(","):
+            entry = part.strip()
+            if entry.startswith("[") and entry.endswith("]"):
+                entry = entry[1:-1]
+            if entry:
+                parts.append(entry)
+        os.environ[key] = ",".join(parts)
+
+
+_sanitize_no_proxy_env()
+
 # Kernel container mirror: _stream_chat_provider is a MODULE-level function
 # and cannot see build_app's closure, so the live PluginManager is mirrored
 # here at boot. _organ_service() resolves an organ service through it and
 # falls back to the built-in module when the organ is off or absent.
 _plugin_container_ref: dict = {}
+
+# Self-evolution service (M1): booted with the plugin container so the
+# pet can inspect its own repo, propose edits into an isolated git
+# worktree, and evaluate them without touching the running app.
+_evolve_service_ref: dict = {}
+
+
+def _evolve_service():
+    return _evolve_service_ref.get("svc")
 
 
 def _organ_service(name: str, fallback):
@@ -152,6 +185,15 @@ _active_user_text_ref: contextvars.ContextVar = contextvars.ContextVar(
 _MAX_DECISION_ROLLS_PER_TURN = 3
 _active_roll_count_ref: contextvars.ContextVar = contextvars.ContextVar(
     "pet_active_roll_count", default=0
+)
+
+# ReflexConfig of the in-flight chat turn (request-scoped shadow of the boot
+# singleton). _stream_chat_provider sits outside build_app's closure, so it
+# reads the config through get_reflex_config(); direct generator tests never
+# build an app, and a per-request override beats the boot value for exactly
+# that turn — the same pattern as _active_chat_provider_ref.
+_active_reflex_config_ref: contextvars.ContextVar = contextvars.ContextVar(
+    "pet_active_reflex_config", default=None
 )
 
 
@@ -403,7 +445,10 @@ from .updater import DEFAULT_SOURCE as DEFAULT_UPDATE_SOURCE
 from .updater import ModelUpdater
 from .sidecar_updater import SidecarUpdater
 from .decision import cortex as _cortex
+from .decision import reflex as _reflex_module
 from .decision.laya_router import BudgetDecision
+from .vitals import Vitals as _Vitals
+from .ledger import Ledger as _Ledger
 
 
 # ── D 核心（快直觉）────────────────────────────────────────────────
@@ -418,10 +463,50 @@ def set_dstate_provider(provider) -> None:
     _dstate_provider = provider
 
 
-# The passive D gate runs before every provider call, including boot. The
-# generic sampler's 0.45s default was too tight for a cold Laya request
-# (observed 452ms fallback to priors), so the gateway gives D a full second.
-CORTEX_DECISION_TIMEOUT = 1.0
+# The passive D gate runs before every provider call, including boot. On CPU
+# a three-question Laya round measures ~1.4-1.9s idle and 5s+ when another
+# local model saturates the machine, so the sampler's 0.45s default always
+# timed out and silently fell back to priors. Autonomous rounds can afford a
+# long budget (they are hidden behind the life-loop floor); a direct user
+# turn keeps the fast-intuition budget and falls back to priors when the
+# machine is busy.
+def _cortex_timeout_env(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if 0.05 <= value <= 60.0:
+            return value
+    return default
+
+
+CORTEX_DECISION_TIMEOUT = _cortex_timeout_env(
+    "PET_CORTEX_DECISION_TIMEOUT", 6.0
+)
+CORTEX_DECISION_TIMEOUT_USER = _cortex_timeout_env(
+    "PET_CORTEX_DECISION_TIMEOUT_USER", 2.5
+)
+
+
+# Brain stream: providers stream reasoning as tiny token deltas. Publishing
+# one "思考" card per fragment floods the feed, so coalesce until a chunk is
+# readable (or a burst pause) and flush the rest when the stream ends.
+# A silent safety fallback looks like a lazy pet, not a broken engine.
+# Alert once per failure streak so the brain feed explains the quiet.
+_D_INTUITION_ALERT = {"streak": 0}
+
+THINK_EVENT_MIN_CHARS = 600
+THINK_EVENT_MIN_SECS = 5.0
+
+
+def _cortex_round_timeout(store, proactive: bool) -> float:
+    if not proactive:
+        return CORTEX_DECISION_TIMEOUT_USER
+    if (os.environ.get("PET_CORTEX_DECISION_TIMEOUT") or "").strip():
+        return CORTEX_DECISION_TIMEOUT
+    return min(30.0, CORTEX_DECISION_TIMEOUT + 4.5 * len(store.questions))
 
 
 def _cortex_enabled() -> bool:
@@ -439,6 +524,224 @@ def _get_dstate_store():
     except Exception as exc:
         get_logger().debug("cortex: D state provider failed: %s", exc)
         return None
+
+
+# ── 生命体征（电量/血量/睡眠）+ 500 轮台账 ─────────────────────────────────
+# build_app boots BOTH once, beside the memory stores (vitals.json /
+# ledger.json live next to events.json in the CURRENT theme's dir — the
+# theme the soul is wearing owns its own life state). _stream_chat_provider
+# sits outside build_app's closure, so accessors mirror the kernel-service
+# pattern (_plugin_container_ref / _evolve_service_ref): module scope,
+# request-free, None before boot. Direct generator tests that never build
+# the app keep their legacy behaviour: no vitals object → no drain, no
+# ledger tick, no short-circuit.
+_vitals_ref: dict = {}
+_ledger_ref: dict = {}
+
+
+def set_vitals(v) -> None:
+    """Install (or reset, with None) the process vitals singleton."""
+    if v is None:
+        _vitals_ref.pop("svc", None)
+    else:
+        _vitals_ref["svc"] = v
+
+
+def set_ledger(v) -> None:
+    """Install (or reset, with None) the process ledger singleton."""
+    if v is None:
+        _ledger_ref.pop("svc", None)
+    else:
+        _ledger_ref["svc"] = v
+
+
+def get_vitals():
+    """The vitals singleton (电量/血量/睡眠), or None outside a built app."""
+    return _vitals_ref.get("svc")
+
+
+def get_ledger():
+    """The ledger singleton (500 轮台账), or None outside a built app."""
+    return _ledger_ref.get("svc")
+
+
+# ── 快直觉 reflex 配置（System 0 的请求设置）────────────────────────────────
+# build_app 启动时加载一次（env > providers.json "reflex" > defaults），存成
+# 模块级单例 —— 与 get_vitals()/get_ledger() 同一模式：_stream_chat_provider
+# 在 build_app 闭包之外，访问配置走模块级。None（未构建 / 加载失败）时聊天
+# 流按"reflex 层缺席"处理，保持旧 D-quiet 行为，绝不影响出话。
+_reflex_config_ref: dict = {}
+
+
+def set_reflex_config(cfg) -> None:
+    """Install (or reset, with None) the process reflex-config singleton."""
+    if cfg is None:
+        _reflex_config_ref.pop("cfg", None)
+    else:
+        _reflex_config_ref["cfg"] = cfg
+
+
+def get_reflex_config():
+    """ReflexConfig for the in-flight turn — the request-scoped shadow ONLY.
+
+    build_app parses the boot singleton from providers.json, but the gate
+    must never arm outside a real routed chat: direct `_stream_chat_provider`
+    calls (tests, internal tools) stay in the legacy world unless something
+    explicitly sets the override. The /api/chat route seeds the shadow from
+    the boot singleton for its request (anyio's start_soon copies the
+    caller's context into the streaming task).
+    """
+    return _active_reflex_config_ref.get()
+
+
+def set_reflex_config_override(cfg) -> None:
+    """Arm (or disable with a disabled ReflexConfig) the reflex gate for
+    direct `_stream_chat_provider` calls — no app boot needed."""
+    _active_reflex_config_ref.set(cfg)
+
+
+def clear_reflex_config_override() -> None:
+    """Drop the request-scoped override; the boot singleton wins again."""
+    _active_reflex_config_ref.set(None)
+
+
+def _mood_label_for_reflex(emotion_index: float) -> str:
+    """Cheap mood word for the reflex state line (情绪指数 → 粗粒度心情词).
+
+    Same threshold family as the emotion temperature modulation — a few
+    comparisons, never a store read. Unknown/neutral lands on 平静.
+    """
+    try:
+        idx = float(emotion_index)
+    except (TypeError, ValueError):
+        return "平静"
+    if idx >= 0.3:
+        return "开心"
+    if idx >= 0.1:
+        return "愉快"
+    if idx <= -0.3:
+        return "难过"
+    if idx <= -0.1:
+        return "低落"
+    return "平静"
+
+
+def _vitals_state_dir():
+    """Directory the vitals/ledger singletons were built in (for
+    graveyard_archive from the module-level chat stream; None pre-boot)."""
+    return _vitals_ref.get("dir")
+
+
+# Pending round-state slot set by the finally block after ledger.round_tick()
+# and consumed by the NEXT round: organize_kind (audit/recap) + the
+# slow-overflow latch. Keys absent/false ⇒ the next round is a normal one.
+_pending_vitals_round: dict = {"organize_kind": None, "overflow": False}
+
+# 记忆整理轮（点 7）：audit 只保留核心记忆工具；recap 一个工具都不给。
+_ORGANIZE_AUDIT_TOOLS = {"memory", "recall", "memory_search"}
+_ORGANIZE_PROMPTS = {
+    "audit": (
+        "【系统提示：这是你的记忆整理时刻。全面检视你的长期记忆——事件、记忆文件夹、"
+        "核心记忆——每一处角落，确认它们仍然是你期望的样子。发现错误就修正，"
+        "发现遗忘就补写。这轮只做整理，不要调用屏幕或桌面工具。】"
+    ),
+    "recap": (
+        "【系统提示：这是你的回顾时刻。下面是最近 100 轮的生命台账（快直觉的一行"
+        "记录与主脑轮的完整记录混排）。用一段话向自己总结这 100 轮里发生了什么——"
+        "你做了什么、想到了什么、有什么悬而未决。只总结，不要调用工具。】"
+    ),
+}
+
+
+def _recent_ledger_lines(lg, n: int = 100) -> list[str]:
+    """Last ``n`` ledger entries as compact recap material, newest last.
+
+    One line per entry: fast → "[快] text HH:MM" (local clock), slow /
+    organize → "[主脑]" / "[整理]" + first line of the text. Every line is
+    capped (100 chars) so 100 entries can never blow up the prompt. Returns
+    [] for a missing ledger; never raises.
+    """
+    if lg is None:
+        return []
+    try:
+        entries = lg.entries()
+    except Exception:
+        return []
+    lines: list[str] = []
+    for entry in entries[-max(1, int(n)):]:
+        kind = str(entry.get("kind") or "")
+        text = str(entry.get("text") or "").strip()
+        ts = str(entry.get("ts") or "")
+        try:
+            clock = datetime.fromisoformat(ts).astimezone().strftime("%H:%M")
+        except Exception:
+            clock = ts[11:16]  # raw ISO slice; better than nothing
+        first = text.splitlines()[0].strip() if text else ""
+        first = first[:100]
+        if kind == "fast":
+            lines.append(f"[快] {first} {clock}".strip())
+        elif kind == "slow":
+            lines.append(f"[主脑] {first}".strip())
+        elif kind == "organize":
+            lines.append(f"[整理] {first}".strip())
+        else:
+            lines.append(f"[其他] {first}".strip())
+    return lines
+
+
+def _default_memory_root() -> Path:
+    """Boot-fallback state dir for graveyard_archive (no built app)."""
+    root = os.environ.get("PET_MEMORY_DIR") or str(Path.home() / ".pet")
+    return Path(root)
+
+
+def _vitals_health() -> dict:
+    """vitals object for /api/health — None fields when the system is off."""
+    v = get_vitals()
+    if v is None:
+        return None
+    try:
+        return {
+            "battery_percent": round(float(v.percent()), 1),
+            "forced_off": bool(v.forced_off),
+            "should_warn": bool(v.should_warn()),
+            "hp": round(float(v.hp), 1),
+            "died": bool(v.died),
+            "asleep": bool(v.is_asleep()),
+            "sleep_stage": v.sleep_stage,
+        }
+    except Exception as exc:
+        get_logger().warning("vitals health read failed: %s", exc)
+        return None
+
+
+def _ledger_health() -> dict:
+    """ledger object for /api/health — None fields when the system is off."""
+    l = get_ledger()
+    if l is None:
+        return None
+    try:
+        return {
+            "round_count": int(l.round_count()),
+            "counts": l.counts(),
+            "pending_recap": bool(l.pending_recap),
+        }
+    except Exception as exc:
+        get_logger().warning("ledger health read failed: %s", exc)
+        return None
+
+
+def _should_archive_death(v) -> bool:
+    """True exactly once per death: died, and not archived this process yet."""
+    if v is None or not bool(v.died):
+        return False
+    try:
+        if getattr(v, "_gateway_archived", False):
+            return False
+        v._gateway_archived = True  # one-way process-local flag
+        return True
+    except Exception:
+        return True
 
 
 # ── Request / response shapes ────────────────────────────────────────────────
@@ -957,6 +1260,43 @@ def build_app(
     event_store = mem_ctx.event_store
     mood_store = mem_ctx.mood_store
 
+    # ── 生命体征 + 500 轮台账（每个主题一份：电量/血量/睡眠 + 台账）──
+    # Same base dir the memory service uses, so vitals.json / ledger.json
+    # live beside events.json of the ACTIVE theme (the sleeping body owns
+    # its own battery, and theme switches swap the soul stores already).
+    # Built once at startup; every mutation persists itself, so the chat
+    # path never needs to remember to save. Failure-isolated: a broken
+    # vitals module must never take chat down — the pipeline treats None
+    # as "system absent" and keeps the legacy behaviour.
+    try:
+        vitals = _Vitals(mem_ctx.theme_dir(mem_ctx.current_theme))
+        ledger = _Ledger(mem_ctx.theme_dir(mem_ctx.current_theme))
+        set_vitals(vitals)
+        set_ledger(ledger)
+        _vitals_ref["dir"] = mem_ctx.theme_dir(mem_ctx.current_theme)
+        log.info(
+            "vitals: battery=%d%% hp=%.0f asleep=%s | ledger: rounds=%d "
+            "(state_dir=%s)",
+            round(vitals.percent()),
+            vitals.hp,
+            bool(vitals.is_asleep()),
+            ledger.round_count(),
+            mem_ctx.theme_dir(mem_ctx.current_theme),
+        )
+        vitals.save()  # vitals.json exists from boot (renderer may read it)
+        ledger.save()
+    except Exception as exc:
+        vitals = None
+        ledger = None
+        set_vitals(None)
+        set_ledger(None)
+        _vitals_ref.pop("dir", None)
+        log.warning("vitals/ledger boot failed (continuing): %s", exc)
+    # Pending-round slot is a module singleton: reset it per boot so a
+    # previous app instance (tests build many) cannot leak an organize mark.
+    _pending_vitals_round.clear()
+    _pending_vitals_round.update({"organize_kind": None, "overflow": False})
+
     # ── D 核心：每个主题一份 <theme_dir>/dstate.json ────────────────
     # The provider resolves the CURRENT theme lazily (theme switches must
     # not need a rebuild). Any failure leaves D off; chat continues.
@@ -1109,6 +1449,34 @@ def build_app(
 
     _pet_plugins._contexts["plugin_forge"] = _forge_ctx()
     _pet_plugins.protect("plugin_forge")
+
+    # ── Self-evolution workbench (M1) ────────────────────────────────
+    # Candidate edits live in a git worktree, never in this process's tree.
+    # Plugin promotion is human-approved; core changes stay review-only in
+    # M1, so nothing the pet proposes can rewrite the running gateway.
+    try:
+        from .evolve.service import EvolveService
+        from .evolve.models import EvolveError  # noqa: F401 (registered for tool errors)
+
+        _repo_root = Path(__file__).resolve().parents[2]
+        _evolve_data = os.environ.get("PET_EVOLVE_DIR")
+        _pet_home = os.environ.get("PET_HOME")
+        _evolve_dir = (
+            Path(_evolve_data).expanduser()
+            if _evolve_data
+            else (Path(_pet_home).expanduser() if _pet_home else Path.home() / ".pet")
+            / "evolve"
+        )
+        _evolve_service_ref["svc"] = EvolveService(
+            _repo_root,
+            data_dir=_evolve_dir,
+            plugin_dir=_petplugins_module.PluginManager.plugin_dir(memory_dir),
+            reload_plugins=lambda: _pet_plugins.sync(),
+        )
+        log.info("evolve: workbench ready at %s", _evolve_dir)
+    except Exception as exc:
+        _evolve_service_ref.pop("svc", None)
+        log.warning("evolve: workbench unavailable (continuing): %s", exc)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -1284,6 +1652,26 @@ def build_app(
                             )
                         except Exception as exc:
                             log.warning("homeostasis: recovery-note write failed: %s", exc)
+
+                    # ── 电量心跳（每 60s 一次）：睡觉充得快，清醒挂机充得慢。
+                    # 每分钟一次性 1 分钟速率（0.5%/min 睡眠 / 0.05%/min 清醒），
+                    # 阈值跨越（forced-off 恢复闩锁、自然醒）由模块自己记账。
+                    # 睡醒只 log（渲染层经 /api/health 或下一轮获知）；这里
+                    # 不产生任何 SSE——循环不是一轮对话。
+                    _vitals_now = get_vitals()
+                    if _vitals_now is not None:
+                        try:
+                            if _vitals_now.is_asleep():
+                                _vitals_now.charge(1.0, asleep=True)
+                                if _vitals_now.natural_wake():
+                                    log.info(
+                                        "vitals: 自然醒（睡眠计时结束），电量 %d%%",
+                                        round(_vitals_now.percent()),
+                                    )
+                            else:
+                                _vitals_now.charge(1.0, asleep=False)
+                        except Exception as exc:
+                            log.warning("vitals charge tick failed: %s", exc)
                 except asyncio.CancelledError:
                     break
                 except Exception as exc:
@@ -1458,6 +1846,26 @@ def build_app(
         except Exception as exc:
             log.warning("Failed to load providers.json: %s", exc)
     _register_providers()
+
+    # ── 快直觉 reflex 配置（System 0）：启动时解析一次 ───────────────
+    # Same ~/.pet/providers.json the API-provider registry above loads from;
+    # env (PET_REFLEX_URL / MODEL / ENABLED) wins over the file's "reflex"
+    # section, which wins over the lfm3-1.7b defaults. Failure-isolated like
+    # vitals/ledger: a broken reflex config must never take chat down — the
+    # stream treats None as "reflex layer absent" and keeps the legacy
+    # D-quiet early-return behaviour.
+    set_reflex_config(None)
+    try:
+        set_reflex_config(_reflex_module.load_reflex_config(_providers_path))
+        # 读启动单例（不是 ContextVar——那在 boot 时刻恒为 None）。
+        _rc = _reflex_config_ref.get("cfg")
+        log.info(
+            "reflex config: url=%s model=%s enabled=%s (providers=%s)",
+            _rc.url, _rc.model, _rc.enabled, _providers_path,
+        )
+    except Exception as exc:
+        set_reflex_config(None)
+        log.warning("reflex config load failed (continuing without): %s", exc)
 
     # ── Builtin tool: observe_screen ──────────────────────────────────
     async def _handle_observe_screen(args):
@@ -1898,6 +2306,160 @@ def build_app(
             return JSONResponse({"ok": False, "error": "values must be an object"}, status_code=400)
         return _pet_plugins.set_plugin_config(name, values)
 
+    # ── self-evolution HTTP surface (human/UI) ───────────────────────
+    # The pet's own tools are above; these endpoints let a human review,
+    # approve plugin promotion, and roll it back. Core candidates stay
+    # review-only in M1 and are refused by the promoter.
+    def _evolve_http_ready():
+        svc = _evolve_service()
+        if svc is None:
+            return None, JSONResponse(
+                {"ok": False, "error": "evolve workbench unavailable"},
+                status_code=503,
+            )
+        return svc, None
+
+    def _evolve_http_error(exc: Exception):
+        from .evolve.models import EvolveError, NotAllowed, NotFound, PromotionRefused
+
+        if isinstance(exc, NotFound):
+            status = 404
+        elif isinstance(exc, (NotAllowed, PromotionRefused, EvolveError)):
+            status = 400
+        else:
+            log.exception("evolve endpoint failed")
+            return JSONResponse(
+                {"ok": False, "error": "internal error"}, status_code=500
+            )
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+
+    @app.get("/api/evolve/inspect")
+    async def evolve_inspect():
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        try:
+            return {"ok": True, "report": await asyncio.to_thread(svc.inspect)}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.get("/api/evolve/source")
+    async def evolve_source(path: str = "", start: int = 1, end: int | None = None):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        try:
+            text = await asyncio.to_thread(
+                svc.read_source, path, start=max(1, start), end=end
+            )
+            return {"ok": True, "text": text}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.get("/api/evolve/candidates")
+    async def evolve_candidates(limit: int = 20):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        try:
+            rows = await asyncio.to_thread(
+                svc.list_candidates, max(1, min(100, limit))
+            )
+            return {"ok": True, "candidates": rows}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.post("/api/evolve/propose")
+    async def evolve_propose(payload: dict = None):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        p = payload if isinstance(payload, dict) else {}
+        try:
+            rec = await asyncio.to_thread(
+                svc.propose,
+                goal=str(p.get("goal") or ""),
+                plan=str(p.get("plan") or ""),
+                edits=p.get("edits"),
+                kind=str(p.get("kind") or "core"),
+                title=str(p.get("title") or ""),
+            )
+            return {"ok": True, "candidate": rec}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.get("/api/evolve/candidates/{candidate_id}")
+    async def evolve_candidate(candidate_id: str):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        try:
+            return {"ok": True, "candidate": await asyncio.to_thread(svc.show, candidate_id)}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.post("/api/evolve/candidates/{candidate_id}/evaluate")
+    async def evolve_candidate_evaluate(candidate_id: str, payload: dict = None):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        p = payload if isinstance(payload, dict) else {}
+        try:
+            result = await asyncio.to_thread(
+                svc.evaluate, candidate_id, full=bool(p.get("full"))
+            )
+            return {"ok": True, "eval": result}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.post("/api/evolve/candidates/{candidate_id}/discard")
+    async def evolve_candidate_discard(candidate_id: str):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        try:
+            rec = await asyncio.to_thread(svc.discard, candidate_id)
+            return {"ok": True, "candidate": rec}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.post("/api/evolve/candidates/{candidate_id}/promote")
+    async def evolve_candidate_promote(candidate_id: str, payload: dict = None):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        p = payload if isinstance(payload, dict) else {}
+        approved_by = str(p.get("approved_by") or "").strip()
+        if not approved_by:
+            return JSONResponse(
+                {"ok": False, "error": "plugin promotion needs approved_by"},
+                status_code=400,
+            )
+        try:
+            result = await asyncio.to_thread(
+                svc.promote, candidate_id, approved_by=approved_by
+            )
+            return {"ok": True, "promotion": result}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
+    @app.post("/api/evolve/rollback")
+    async def evolve_rollback(payload: dict = None):
+        svc, err = _evolve_http_ready()
+        if err is not None:
+            return err
+        p = payload if isinstance(payload, dict) else {}
+        promotion_id = str(p.get("promotion_id") or "").strip()
+        if not promotion_id:
+            return JSONResponse(
+                {"ok": False, "error": "need promotion_id"}, status_code=400
+            )
+        try:
+            result = await asyncio.to_thread(svc.rollback, promotion_id)
+            return {"ok": True, "rollback": result}
+        except Exception as exc:
+            return _evolve_http_error(exc)
+
     mcp_manager.register_builtin({
         "name": "screen_click",
         "description": (
@@ -2304,6 +2866,25 @@ def build_app(
                 )
         except Exception:
             pass
+        # 换身体的生命体征（soul isolation）：电量/血量/睡眠 + 500 轮台账
+        # 属于当前身体，跟着主题换店——否则新灵魂继承旧身体的电量/HP/睡
+        # 眠，台账也会跨灵魂串写。Rebuild both singletons on the new theme
+        # dir; each loads that theme's own vitals.json / ledger.json (per-
+        # soul state), and the old theme's files stay untouched on disk.
+        try:
+            _new_vitals_dir = mem_ctx.theme_dir(mem_ctx.current_theme)
+            if get_vitals() is not None and get_ledger() is not None:
+                _new_vitals = _Vitals(_new_vitals_dir)
+                _new_ledger = _Ledger(_new_vitals_dir)
+                set_vitals(_new_vitals)
+                set_ledger(_new_ledger)
+                log.info(
+                    "vitals/ledger switched to theme %s (battery=%d%% rounds=%d)",
+                    slug, round(_new_vitals.percent()), _new_ledger.round_count(),
+                )
+            _vitals_ref["dir"] = _new_vitals_dir  # _vitals_state_dir() follows the body (graveyard_archive)
+        except Exception as exc:
+            log.warning("vitals/ledger theme switch failed (continuing): %s", exc)
         _pet_plugins.emit("theme_switched", theme=slug)
         return {
             "ok": True,
@@ -2716,6 +3297,11 @@ def build_app(
             # healthy sidecar as unhealthy and kill/respawns it in a loop
             # the moment the active model is a remote one.
             "engine_enabled": _engine_enabled(),
+            # ── 生命体征 + 台账（renderer HUD learns the battery/sleep
+            # state here; the sleeping animation itself is the renderer
+            # phase's job）──
+            "vitals": _vitals_health(),
+            "ledger": _ledger_health(),
         }
 
     @app.get("/api/devices")
@@ -3326,6 +3912,15 @@ def build_app(
         )
 
         lora_arr = _lora_arr_for(req)
+        # 快直觉 reflex 配置随请求注入：build_app 启动解析的单例在
+        # _stream_chat_provider（build_app 闭包之外）里经 get_reflex_config()
+        # 读取。播种进本请求的 context——生成器（anyio start_soon 会复制
+        # 调用者上下文）整轮可见；而直接调用生成器的测试路径（不经过
+        # 路由）不会被动武装，reflex 门只对真实 HTTP 生命轮生效。
+        # 注意：这里必须播种启动单例（_reflex_config_ref["cfg"]），
+        # 不能调 get_reflex_config()——那读的是本请求的 ContextVar，
+        # 路由入口处恒为 None，等于自己 seed 自己（2026-11-23 死枪 bug）。
+        set_reflex_config_override(_reflex_config_ref.get("cfg"))
         # The raw conversation log belongs to the current theme's soul, so
         # sleep compression and events.json share one memory root.
         conversation_dir = mem_ctx.theme_dir(mem_ctx.current_theme)
@@ -3743,6 +4338,8 @@ def _visible_reply_text(text: str) -> str:
         return ""
     # The hidden DSTATE block (and an unfinished one) is never visible.
     text = _cortex.strip_dstate_blocks(text)
+    # API reasoning and inline <think> blocks are not speech or inner voice.
+    text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", text, flags=re.IGNORECASE)
     # An unclosed MEM block still hides everything after its opener.
     s = re.sub(
         r"<<<MEM>>>[\s\S]*?(?:<<<MEMEND>>>|$)",
@@ -3753,12 +4350,18 @@ def _visible_reply_text(text: str) -> str:
     # A MEM block split across tool rounds can leave a lone opener/closer.
     # A tag is control data, never speech, so drop any stray marker.
     s = re.sub(r"<<<(?:MEM|MEMEND)>>>", "", s, flags=re.IGNORECASE)
+    # Hallucinated native tool markup is never speech: real calls arrive via
+    # the tool_calls channel or [MCP:] text markers, not <tool_call> tags.
+    s = re.sub(r"<tool_call>[\s\S]*?(?:</tool_call>|$)", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"</?tool_call>", "", s, flags=re.IGNORECASE)
     s = re.sub(
-        r"\[\s*(?:EMOTION|NEXT_CHAT|WALK_DESKTOP|WALK|INNER)\s*[^\]]*\]",
+        r"\[\s*(?:EMOTION|NEXT_CHAT|WALK_DESKTOP|WALK|TURN|INNER)\s*[^\]]*\]",
         "",
         s,
         flags=re.IGNORECASE,
     )
+    s = re.sub(r"\[\s*(?:INNER|WALK|TURN|EMOTION|NEXT_CHAT)\s*:[^\]]*$", "", s, flags=re.IGNORECASE)
+    s = _INLINE_TOOL_MARKER_RE.sub("", s)
     kept: list[str] = []
     for line in s.splitlines():
         stripped = line.strip()
@@ -3888,6 +4491,47 @@ def _clawd_headers() -> dict:
     return {"Content-Type": "application/json", "x-clawd-token": token}
 
 
+async def _pet_action(kind: str, **payload) -> dict:
+    """Execute one body action; only an Electron confirmation means completion."""
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await asyncio.wait_for(
+                client.post(
+                    f"http://127.0.0.1:{_clawd_port()}/pet/act",
+                    json={"kind": kind, **payload},
+                    headers=_clawd_headers(),
+                    timeout=8.0,
+                ),
+                timeout=8.0,
+            )
+            data = resp.json()
+        except Exception as exc:
+            return {"status": "error", "applied": False, "message": str(exc)}
+    return data if isinstance(data, dict) else {"status": "error", "applied": False, "message": "invalid body response"}
+
+
+def _remember_body_action(kind: str, result: dict) -> None:
+    if result.get("status") != "ok" or result.get("applied") is not True:
+        return
+    # Attention-density receipt: every applied body/tool event is a cheap
+    # "the world moved" signal for the tempo temperature rules.
+    try:
+        _DENSITY_EVENTS.append((time.time(), str(kind or "")))
+        if len(_DENSITY_EVENTS) > 64:
+            del _DENSITY_EVENTS[:-64]
+    except Exception:
+        pass
+    try:
+        if _body_log_ref is not None:
+            detail = (
+                f"-> ({result.get('x')}, {result.get('y')})"
+                if kind == "walk" else result.get("facing", "")
+            )
+            _body_log_ref.append(kind, detail, source="applied")
+    except Exception:
+        pass
+
+
 async def _pet_view_for_capture() -> Optional[dict]:
     """Best-effort /world/bodies geometry for a cone-shaped screenshot.
 
@@ -3944,7 +4588,9 @@ def crop_to_vision_cone(
         if not (0 <= eye_x < img.width and 0 <= eye_y < img.height):
             return None
 
-        radius = FOV_RANGE_PX * scale
+        # Extend the sector beyond the screenshot so the cone reaches the
+        # display edge instead of stopping at a fixed 400px radius.
+        radius = max(img.width, img.height) * 2.0
         center = 180.0 if str(facing or "").lower() == "left" else 0.0
         points = [(eye_x, eye_y)]
         for i in range(25):
@@ -4047,7 +4693,7 @@ def _format_windows_scout(windows: list, pet: dict, facing: str) -> str:
     for w in windows:
         w["_view"] = _window_view(pet, w.get("rect") or {}, facing)
     windows.sort(key=lambda w: (0 if w["_view"]["in_view"] else 1, w["_view"]["dist"]))
-    lines = ["你环顾四周，看到了这些窗户（可以自己挑一扇收养成刚体）："]
+    lines = ["系统返回这些窗户的几何位置（不是屏幕图像；可以自己挑一扇收养成刚体）："]
     wa = None
     try:
         wa = _LAST_WORLD_WA.get("rect")
@@ -4113,6 +4759,10 @@ async def _world_tool(name: str, args: dict) -> str:
     """执行桌面刚体工具（pet_world_bodies / pet_world_walk_to / pet_world_operate）。"""
     port = _clawd_port()
     headers = _clawd_headers()
+
+    def reply(summary: str, status: str = "error", applied: bool = False) -> str:
+        return json.dumps({"status": status, "applied": applied, "summary": summary}, ensure_ascii=False)
+
     try:
         async with httpx.AsyncClient(timeout=2.5) as client:
             if name == "pet_world_bodies":
@@ -4125,7 +4775,7 @@ async def _world_tool(name: str, args: dict) -> str:
                 resp = await client.get("http://127.0.0.1:%d/world/windows" % port, headers=headers)
                 data = resp.json()
                 if data.get("status") == "error":
-                    return "看不了窗户：%s" % (data.get("message") or "unknown")
+                    return reply("看不了窗户：%s" % (data.get("message") or "unknown"))
                 _LAST_WORLD_WA["rect"] = data.get("wa")
                 return _format_windows_scout(
                     data.get("windows") or [],
@@ -4135,46 +4785,46 @@ async def _world_tool(name: str, args: dict) -> str:
             if name == "pet_world_adopt":
                 hwnd = str(args.get("hwnd") or "").strip()
                 if not hwnd:
-                    return "要传 hwnd（从 pet_world_scout 里选）。"
+                    return reply("要传 hwnd（从 pet_world_scout 里选）。")
                 resp = await client.post(
                     "http://127.0.0.1:%d/world/add" % port,
                     json={"hwnd": hwnd},
                     headers=headers,
                 )
                 data = resp.json()
-                if data.get("status") == "ok":
+                if data.get("status") == "ok" and data.get("applied", True) is True:
                     b = data.get("body") or {}
                     try:
                         if _body_log_ref is not None:
                             _body_log_ref.append(
-                                "adopt", "hwnd=%s label=%s" % (hwnd, b.get("label") or "?"), source="intent"
+                                "adopt", "hwnd=%s label=%s" % (hwnd, b.get("label") or "?"), source="applied"
                             )
                     except Exception:
                         pass
-                    return "收养成功：「%s」现在是刚体 id=%s，可以走过去或站上去了。" % (
-                        b.get("label") or "窗户",
-                        b.get("id"),
-                    )
+                    return reply("收养成功：「%s」现在是刚体 id=%s，可以走过去或站上去了。" % (
+                        b.get("label") or "窗户", b.get("id"),
+                    ), "ok", True)
                 _msg = str(data.get("message") or "unknown")
                 if "already" in _msg:
-                    return "这扇窗户已经是刚体了。"
-                return "[world] 收养失败：%s" % _msg
+                    return reply("这扇窗户已经是刚体了。", "not_applied")
+                return reply("[world] 收养失败：%s" % _msg,
+                             "not_applied" if data.get("status") == "ok" else "error")
             if name == "pet_world_walk_to":
                 body_id = int(args.get("id") or 0)
                 stand = bool(args.get("stand"))
                 resp = await client.get("http://127.0.0.1:%d/world/bodies" % port, headers=headers)
                 data = resp.json()
                 if data.get("status") == "error":
-                    return "桌面物理现在不可用：%s" % (data.get("message") or "unknown")
+                    return reply("桌面物理现在不可用：%s" % (data.get("message") or "unknown"))
                 pet = data.get("pet") or {}
                 chosen = next(
                     (b for b in (data.get("bodies") or []) if int(b.get("id") or -1) == body_id),
                     None,
                 )
                 if chosen is None:
-                    return "没有 id=%s 的刚体（先 pet_world_bodies 看看有哪些）。" % body_id
+                    return reply("没有 id=%s 的刚体（先 pet_world_bodies 看看有哪些）。" % body_id)
                 if not pet:
-                    return "拿不到自己的位置，走不动。"
+                    return reply("拿不到自己的位置，走不动。")
                 if stand:
                     # 最大化窗户顶边在屏幕外：物理上站不上去（会被物理引擎
                     # 弹回地面），诚实拒绝而不是静默钳制。
@@ -4182,38 +4832,30 @@ async def _world_tool(name: str, args: dict) -> str:
                         wa_top = float((data.get("wa") or {}).get("y", 0))
                         ph = float(pet.get("height", 0))
                         if float(chosen["rect"]["top"]) - ph / 2 < wa_top:
-                            return "「%s」是铺满屏幕的最大化窗户，顶边在屏幕外，站不上去——走到旁边（stand=false）或者换一扇吧。" % (chosen.get("label") or "刚体")
+                            return reply("「%s」是铺满屏幕的最大化窗户，顶边在屏幕外，站不上去——走到旁边（stand=false）或者换一扇吧。" % (chosen.get("label") or "刚体"), "not_applied")
                     except (KeyError, TypeError, ValueError):
                         pass
                 delta = _walk_to_delta(pet, chosen, stand=stand)
                 if delta is None:
-                    return "这个刚体的几何信息不可用。"
+                    return reply("这个刚体的几何信息不可用。")
                 dx, dy = (round(delta[0]), round(delta[1]))
                 if dx == 0 and dy == 0:
-                    return "已经在「%s」%s了。" % (chosen.get("label") or "刚体", "上面" if stand else "旁边")
+                    return reply("已经在「%s」%s了。" % (chosen.get("label") or "刚体", "上面" if stand else "旁边"), "not_applied")
                 wresp = await client.post(
-                    "http://127.0.0.1:%d/pet/walk" % port,
-                    json={"dx": dx, "dy": dy},
+                    "http://127.0.0.1:%d/pet/act" % port,
+                    json={"kind": "walk", "dx": dx, "dy": dy},
                     headers=headers,
+                    timeout=8.0,
                 )
                 wdata = wresp.json()
-                if wdata.get("status") == "ok":
-                    try:
-                        if _body_log_ref is not None:
-                            _body_log_ref.append(
-                                "walk_to",
-                                "id=%s stand=%s -> (%s, %s)" % (body_id, stand, wdata.get("x"), wdata.get("y")),
-                                source="intent",
-                            )
-                    except Exception:
-                        pass
-                    return "走到了「%s」%s（现在的位置 x=%s, y=%s）。" % (
-                        chosen.get("label") or "刚体",
-                        "上面" if stand else "旁边",
-                        wdata.get("x"),
-                        wdata.get("y"),
-                    )
-                return "[world] 走不过去：%s" % (wdata.get("message") or "unknown")
+                if wdata.get("status") == "ok" and wdata.get("applied") is True:
+                    _remember_body_action("walk", wdata)
+                    return json.dumps(dict(wdata, summary="走到了「%s」%s（现在的位置 x=%s, y=%s）。" % (
+                        chosen.get("label") or "刚体", "上面" if stand else "旁边",
+                        wdata.get("x"), wdata.get("y"),
+                    )), ensure_ascii=False)
+                return reply("[world] 走不过去：%s" % (wdata.get("message") or "unknown"),
+                             "error" if wdata.get("status") == "error" else "not_applied")
             if name == "pet_world_operate":
                 body_id = int(args.get("id") or 0)
                 action = str(args.get("action") or "")
@@ -4224,25 +4866,24 @@ async def _world_tool(name: str, args: dict) -> str:
                     "http://127.0.0.1:%d/world/op" % port, json=payload, headers=headers
                 )
                 data = resp.json()
-                if data.get("status") == "ok":
+                if data.get("status") == "ok" and data.get("applied", True) is True:
                     try:
                         if _body_log_ref is not None:
-                            _body_log_ref.append(action, "id=%s" % body_id, source="intent")
+                            _body_log_ref.append(action, "id=%s" % body_id, source="applied")
                     except Exception:
                         pass
                     to = data.get("to") or {}
-                    return "动作 %s 完成，刚体移动到 (x=%s, y=%s)" % (
-                        action,
-                        round(to.get("x", 0)),
-                        round(to.get("y", 0)),
-                    )
+                    return reply("动作 %s 完成，刚体移动到 (x=%s, y=%s)" % (
+                        action, round(to.get("x", 0)), round(to.get("y", 0)),
+                    ), "ok", True)
                 _msg = str(data.get("message") or "unknown")
                 if "physics is not running" in _msg or "unavailable" in _msg:
-                    return "桌面物理现在不可用：%s" % _msg
-                return "[world] 操作失败：%s" % _msg
+                    return reply("桌面物理现在不可用：%s" % _msg)
+                return reply("[world] 操作失败：%s" % _msg,
+                             "not_applied" if data.get("status") == "ok" else "error")
     except Exception as exc:
-        return "[world] 连接桌宠失败：%s" % exc
-    return "[world] 未知工具 %s" % name
+        return reply("[world] 连接桌宠失败：%s" % exc)
+    return reply("[world] 未知工具 %s" % name)
 
 
 _WORLD_VIEW_CACHE: dict = {"t": 0.0, "bodies": [], "facing": "right"}
@@ -4316,6 +4957,160 @@ def _format_vision_context() -> str:
         ))
     lines.append("（视野外的东西你看不见；想看清可以走近或转头。）")
     return "\n".join(lines)
+
+
+def _evolve_json(payload: Any, limit: int = 12000) -> str:
+    text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    if len(text) > limit:
+        return text[:limit] + "\n…（已截断）"
+    return text
+
+
+async def _evolve_tool(name: str, args: dict) -> str:
+    """Built-in self-evolution tools.
+
+    The service is synchronous (git + subprocess); ``to_thread`` keeps the
+    streaming event loop responsive while a candidate test suite runs.
+    """
+    svc = _evolve_service()
+    if svc is None:
+        return "[evolve] 自我进化工作台没有启动。"
+    from .evolve.models import EvolveError
+
+    args = args if isinstance(args, dict) else {}
+    try:
+        if name == "pet_evolve_inspect":
+            return await asyncio.to_thread(svc.inspect)
+        if name == "pet_evolve_read":
+            path = str(args.get("path") or "").strip()
+            if not path:
+                return "[evolve] 需要 path（仓库相对路径）。"
+            try:
+                start = max(1, int(args.get("start") or 1))
+            except (TypeError, ValueError):
+                start = 1
+            end = args.get("end")
+            if end is not None:
+                try:
+                    end = max(start, int(end))
+                except (TypeError, ValueError):
+                    end = None
+            return await asyncio.to_thread(
+                svc.read_source, path, start=start, end=end
+            )
+        if name == "pet_evolve_propose":
+            goal = str(args.get("goal") or "").strip()
+            plan = str(args.get("plan") or "").strip()
+            edits = args.get("edits")
+            if not goal or not plan or not isinstance(edits, list):
+                return "[evolve] 需要 goal、plan 和 edits=[{path,old,new}]。"
+            rec = await asyncio.to_thread(
+                svc.propose,
+                goal=goal,
+                plan=plan,
+                edits=edits,
+                kind=str(args.get("kind") or "core"),
+                title=str(args.get("title") or ""),
+            )
+            return _evolve_json(
+                {
+                    "candidate_id": rec.get("id"),
+                    "kind": rec.get("kind"),
+                    "status": rec.get("status"),
+                    "files_changed": rec.get("files_changed"),
+                    "diff_sha256": rec.get("diff_sha256"),
+                    "base_dirty": rec.get("base_dirty"),
+                    "next": "调用 pet_evolve_evaluate 下载/运行测试；核心改动在 M1 只审阅。",
+                }
+            )
+        if name == "pet_evolve_evaluate":
+            cid = str(args.get("candidate_id") or "").strip()
+            if not cid:
+                return "[evolve] 需要 candidate_id。"
+            result = await asyncio.to_thread(
+                svc.evaluate, cid, full=bool(args.get("full"))
+            )
+            return _evolve_json(result)
+        if name == "pet_evolve_list":
+            try:
+                limit = max(1, min(50, int(args.get("limit") or 20)))
+            except (TypeError, ValueError):
+                limit = 20
+            return _evolve_json(await asyncio.to_thread(svc.list_candidates, limit))
+        if name == "pet_evolve_show":
+            cid = str(args.get("candidate_id") or "").strip()
+            if not cid:
+                return "[evolve] 需要 candidate_id。"
+            rec = await asyncio.to_thread(svc.show, cid)
+            view = {
+                key: rec.get(key)
+                for key in (
+                    "id",
+                    "kind",
+                    "title",
+                    "goal",
+                    "plan",
+                    "status",
+                    "eval_status",
+                    "verified",
+                    "base_commit",
+                    "base_dirty",
+                    "files_changed",
+                    "diff_sha256",
+                    "plugin_name",
+                    "promotion_id",
+                    "created_at",
+                    "eval",
+                )
+            }
+            try:
+                diff_path = svc.store.candidate_dir(cid) / "diff.patch"
+                if diff_path.is_file():
+                    diff = diff_path.read_text(encoding="utf-8")
+                    view["diff"] = diff[-8000:]
+            except Exception:
+                pass
+            return _evolve_json(view)
+        if name == "pet_evolve_discard":
+            cid = str(args.get("candidate_id") or "").strip()
+            if not cid:
+                return "[evolve] 需要 candidate_id。"
+            rec = await asyncio.to_thread(svc.discard, cid)
+            return _evolve_json({"candidate_id": rec.get("id"), "status": rec.get("status")})
+        return f"[evolve] 未知工具: {name}"
+    except EvolveError as exc:
+        return f"[evolve] {exc}"
+    except Exception as exc:
+        _note_failure("evolve_tool", exc)
+        return f"[evolve error: {type(exc).__name__}: {exc}]"
+
+
+def _tool_feedback_text(result: Any, summary: str, limit: int = 6000) -> str:
+    """The payload a text-only/native model should see after a tool call.
+
+    ``memory list`` puts the actual tree in ``content`` while its one-line
+    ``summary`` is only the usage note. Feeding back the summary alone made
+    the web model say "目录回来了，但里面没列出具体文件" and then guess
+    paths. Prefer the real content when it is small and text-only; fall back
+    to the human summary for oversized/binary results.
+    """
+    try:
+        if isinstance(result, dict):
+            content = result.get("content")
+            if isinstance(content, list):
+                texts = []
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "text":
+                        continue
+                    text = part.get("text")
+                    if text:
+                        texts.append(str(text))
+                text = "\n".join(texts).strip()
+                if text and len(text) <= limit and "base64," not in text[:200]:
+                    return text
+    except Exception:
+        pass
+    return summary
 
 
 def _intuition_tool(name: str, args: dict) -> str:
@@ -4499,7 +5294,9 @@ async def _decision_tool(args: dict) -> dict:
     current_state = {
         "user_text": _active_user_text(),
         "is_proactive": not _active_user_text(),
-        "last_action": (store.last_decision or {}).get("action", ""),
+        "now": time.time(),
+        "last_user": dict(store.last_user or {}),
+        "last_round": dict(store.last_round or {}),
     }
     action_options = args.get("action_options")
     if not isinstance(action_options, list):
@@ -4540,6 +5337,161 @@ async def _decision_tool(args: dict) -> dict:
     }
 
 
+# ── 节奏（tempo）状态机 ──────────────────────────────────────────────────────
+# Three primary cadence tiers. The DEFAULT resting cadence is "slow"
+# (~4–6 min between life rounds): the cheap small-model reflex layer will
+# handle in-between ticks later, so slowing the main-brain cadence IS the
+# token saving for now. The renderer samples the actual next-tick delay from
+# the tempo SSE event; _TEMPO_SPECS here is the authoritative source for the
+# interval semantics AND for the per-round temperature base.
+_TEMPO_MODES = ("ultra", "fast", "slow")
+_TEMPO_SPECS = {
+    "ultra": {"interval_s": (50, 70), "temp": 1.3, "label": "极快反应"},
+    "fast": {"interval_s": (90, 150), "temp": 1.2, "label": "快反应"},
+    "slow": {"interval_s": (240, 360), "temp": 1.0, "label": "慢反应"},
+}
+_TEMPO_DEFAULT = "slow"
+# A model/user-set tempo expires after 10 minutes and falls back to
+# derivation (currently: the resting "slow" cadence).
+_TEMPO_TTL_S = 600.0
+# Two consecutive real user turns within this gap mean an active
+# conversation → "ultra"; a lone turn is chat mode → "fast".
+_TEMPO_CHAT_FAST_GAP_S = 120.0
+
+# The server-side tempo store: a mode set by the model (pet_set_tempo) or by
+# chat-mode entry survives across rounds until it expires. Empty mode or an
+# expired entry ⇒ fall through to per-round derivation.
+_TEMPO_STATE = {"mode": "", "expires_at": 0.0, "source": ""}
+
+
+# ── Attention density (注意力密度 → 温度微调) ────────────────────────────────
+# Cheap, deterministic rules (documented upgrade point: a Laya density meter
+# later). "high" only counts a very recent real user turn; "medium" covers
+# residual conversational context and fresh tool activity. The delta nudges
+# the tempo temperature by ±0.01: high attention cools the sampling slightly,
+# low attention lets the tempo base stand.
+_TEMPO_DENSITY_DELTAS = {"low": 0.0, "medium": 0.01, "high": -0.01}
+# Tool/body events recorded by _remember_body_action within this window
+# count as fresh activity for the "medium" level.
+_DENSITY_EVENT_WINDOW_S = 300.0
+_DENSITY_EVENT_MEDIUM_COUNT = 2
+
+# Module-level receipt sink: _remember_body_action appends (timestamp, kind)
+# for every *applied* body/tool event; the density rules count them. Kept
+# tiny and pruned on read.
+_DENSITY_EVENTS: list[tuple[float, str]] = []
+_DENSITY_STATE: dict = {"last_round_at": 0.0, "last_user_turn_at": 0.0}
+
+
+def _density_level(now: float) -> str:
+    """Attention density for this round: high / medium / low (deterministic)."""
+    last_user = float(_DENSITY_STATE.get("last_user_turn_at") or 0.0)
+    last_round = float(_DENSITY_STATE.get("last_round_at") or 0.0)
+    if last_user > 0.0 and 0.0 <= now - last_user <= 60.0:
+        return "high"
+    user_5min = last_user > 0.0 and 0.0 <= now - last_user <= 300.0
+    fresh_events = [
+        (ts, kind) for ts, kind in _DENSITY_EVENTS
+        if (last_round <= 0.0 or ts > last_round)
+        and 0.0 <= now - ts <= _DENSITY_EVENT_WINDOW_S
+    ]
+    if user_5min or len(fresh_events) >= _DENSITY_EVENT_MEDIUM_COUNT:
+        return "medium"
+    return "low"
+
+
+def _density_delta(now: float) -> float:
+    """Temperature delta for the resolved density level (±0.01 / 0)."""
+    return _TEMPO_DENSITY_DELTAS.get(_density_level(now), 0.0)
+
+
+def _set_tempo(mode: str, source: str, ttl_s: float = _TEMPO_TTL_S) -> str:
+    """Write a tempo into the store; unknown modes fall back to the default.
+
+    Returns the mode actually stored (the fallback is part of the contract:
+    pet_set_tempo keeps its "invalid → slow" behaviour).
+    """
+    mode = str(mode or "").strip().lower()
+    if mode not in _TEMPO_MODES:
+        mode = _TEMPO_DEFAULT
+    try:
+        ttl = float(ttl_s)
+    except (TypeError, ValueError):
+        ttl = _TEMPO_TTL_S
+    if ttl <= 0:
+        ttl = _TEMPO_TTL_S
+    _TEMPO_STATE["mode"] = mode
+    _TEMPO_STATE["expires_at"] = time.time() + ttl
+    _TEMPO_STATE["source"] = str(source or "")
+    return mode
+
+
+def _resolve_tempo(now: float) -> tuple[str, str]:
+    """One tempo decision per round → (mode, source).
+
+    Store wins while fresh; otherwise derive. The derivation has collapsed
+    to the resting cadence: idle no longer changes tempo (fatigue/rest is a
+    separate battery system's job — token consumption, not wall-clock idle).
+    """
+    state_mode = str(_TEMPO_STATE.get("mode") or "").strip().lower()
+    if state_mode in _TEMPO_MODES and float(_TEMPO_STATE.get("expires_at") or 0.0) > now:
+        return state_mode, str(_TEMPO_STATE.get("source") or "store")
+    return _TEMPO_DEFAULT, "derive"
+
+
+def _note_user_turn_for_tempo(now: float) -> str:
+    """Chat-mode entry: a real user turn switches the AI to a faster tempo.
+
+    Two user turns within _TEMPO_CHAT_FAST_GAP_S = active conversation
+    ("ultra"); otherwise plain chat mode ("fast"). The tempo expires with the
+    normal TTL, so after ~10 quiet minutes the round derivation takes over
+    again. Returns the mode it set.
+    """
+    previous = float(_TEMPO_STATE.get("last_user_turn_at") or 0.0)
+    mode = (
+        "ultra"
+        if previous > 0.0 and 0.0 <= now - previous <= _TEMPO_CHAT_FAST_GAP_S
+        else "fast"
+    )
+    _set_tempo(mode, "chat")
+    _TEMPO_STATE["last_user_turn_at"] = now
+    return mode
+
+
+# ── Tool display labels（工具中文名，仅用于展示） ────────────────────────────
+# Display text only: the `tool=`/meta fields in SSE events and the
+# narration-strip regex contract stay the RAW tool id (machine-readable).
+# Unknown tools fall back to the raw id.
+_TOOL_LABELS = {
+    "capture_screen": "看屏幕",
+    "observe_screen": "读屏幕文字",
+    "screen_click": "点击屏幕",
+    "desktop_task": "桌面任务",
+    "memory": "记忆",
+    "recall": "回忆",
+    "memory_search": "搜记忆",
+    "pet_decision": "直觉判断",
+    "pet_decision_roll": "掷骰",
+    "pet_override_decision": "改判",
+    "pet_enter_slow": "深思考",
+    "pet_set_tempo": "调节奏",
+    "pet_world_walk_to": "走向刚体",
+    "pet_world_scout": "扫视周围",
+    "pet_world_bodies": "看周围刚体",
+    "pet_world_adopt": "收养刚体",
+    "pet_turn_head": "转头",
+    "pet_forge_plugin": "造器官",
+    "pet_mood_now": "看心情",
+    "pet_self_note_add": "写自我笔记",
+    "pet_self_note_read": "读自我笔记",
+}
+
+
+def _tool_label(tool_name: str) -> str:
+    """Chinese display label for a tool id; unknown tools keep the raw id."""
+    return _TOOL_LABELS.get(tool_name, tool_name)
+
+
 CORE_TOOL_NAMES = {
     "memory",
     "recall",
@@ -4553,6 +5505,8 @@ CORE_TOOL_NAMES = {
     # first-class soul tools on every provider tier.
     "pet_enter_slow",
     "pet_decision",
+    "pet_set_tempo",
+    "pet_turn_head",
 }
 
 
@@ -4715,6 +5669,149 @@ async def _gather_tools(
                 "required": ["name"],
             },
         ))
+    # 自我进化工作台（M1）：先看自己，再在隔离 worktree 里提出/评测改动。
+    if _evolve_service() is not None:
+        tool_defs.append(ToolDef(
+            server_name="pet-evolve",
+            name="pet_evolve_inspect",
+            description=(
+                "检查你自己的代码与运行环境：模块、测试入口、插件、最近进化谱系。"
+                "想改自己之前先看这个。"
+            ),
+            input_schema={"type": "object", "properties": {}},
+        ))
+        tool_defs.append(ToolDef(
+            server_name="pet-evolve",
+            name="pet_evolve_read",
+            description=(
+                "读你自己仓库里的一段源码（带行号）。path 是仓库相对路径，"
+                "例如 pet-sidecar/gateway/server.py。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start": {"type": "integer", "description": "起始行，默认 1"},
+                    "end": {"type": "integer", "description": "结束行（含）"},
+                },
+                "required": ["path"],
+            },
+        ))
+        tool_defs.append(ToolDef(
+            server_name="pet-evolve",
+            name="pet_evolve_propose",
+            description=(
+                "提出一个真实的自我修改候选：在隔离的 git worktree 里应用 edits 并生成 diff，"
+                "不会改动正在运行的代码。edits=[{path,old,new}]；old 必须精确匹配一次，"
+                "新建文件时 old 为空。kind=core|plugin；核心改动在 M1 只审阅、不上线。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "为什么要改"},
+                    "plan": {"type": "string", "description": "怎么改，可能的分支/风险"},
+                    "title": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["core", "plugin"]},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "old": {"type": "string"},
+                                "new": {"type": "string"},
+                            },
+                            "required": ["path", "old", "new"],
+                        },
+                    },
+                },
+                "required": ["goal", "plan", "edits"],
+            },
+        ))
+        tool_defs.append(ToolDef(
+            server_name="pet-evolve",
+            name="pet_evolve_evaluate",
+            description=(
+                "在候选 worktree 里跑聚焦测试并与基线对比，返回 "
+                "verified/failed/unverified。verified 只说明没弄坏，不等于该上线。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string"},
+                    "full": {"type": "boolean", "description": "跑整个 Python 测试套件（慢）"},
+                },
+                "required": ["candidate_id"],
+            },
+        ))
+        tool_defs.append(ToolDef(
+            server_name="pet-evolve",
+            name="pet_evolve_list",
+            description="列出你的进化候选与状态。",
+            input_schema={
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            },
+        ))
+        tool_defs.append(ToolDef(
+            server_name="pet-evolve",
+            name="pet_evolve_show",
+            description="看一个候选的改动、评测结果和 diff（截断）。",
+            input_schema={
+                "type": "object",
+                "properties": {"candidate_id": {"type": "string"}},
+                "required": ["candidate_id"],
+            },
+        ))
+        tool_defs.append(ToolDef(
+            server_name="pet-evolve",
+            name="pet_evolve_discard",
+            description="丢弃一个候选并删掉它的隔离 worktree（不会碰正在运行的代码）。",
+            input_schema={
+                "type": "object",
+                "properties": {"candidate_id": {"type": "string"}},
+                "required": ["candidate_id"],
+            },
+        ))
+    tool_defs.append(ToolDef(
+        server_name="pet-body",
+        name="pet_turn_head",
+        description=(
+            "只转头看左边或右边：身体不动，视锥方向立刻跟着转。"
+            "想看清另一侧时先用它，再调用 capture_screen / pet_world_bodies。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["left", "right"],
+                    "description": "转向哪一侧",
+                },
+            },
+            "required": ["direction"],
+        },
+    ))
+    tool_defs.append(ToolDef(
+        server_name="pet-tempo",
+        name="pet_set_tempo",
+        description=(
+            "决定你接下来的反应节奏（持续生效，直到过期或你再次调用）。"
+            "slow=慢反应（约4–6分钟一次，默认）、fast=快反应（约1.5–2.5分钟，聊天时用）、"
+            "ultra=极快反应（约50–70秒，活跃对话时用）。默认慢反应。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": list(_TEMPO_MODES),
+                    "description": "接下来的反应节奏",
+                },
+            },
+            "required": ["mode"],
+        },
+    ))
     if core_only:
         tool_defs = [t for t in tool_defs if t.name in CORE_TOOL_NAMES]
     return tool_defs or None
@@ -4762,6 +5859,137 @@ def _should_log_conversation(req: ChatRequest, conversation_dir: Optional[Path])
     return _real_user_turn_text(req) is not None
 
 
+def _extract_memory_section(
+    episodic_ctx: str, marker: str, *, limit: int
+) -> str:
+    """Return one section of the gateway's episodic memory context."""
+    text = str(episodic_ctx or "")
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    tail = text[start + len(marker):]
+    for stop in (
+        "\n【突然浮现在脑海中的事】",
+        "\n【你经历过但记不清细节的事】",
+        "\n【你记得的事】",
+        "\n【你一直放在心上的事】",
+        "\n（现在是",
+    ):
+        cut = tail.find(stop)
+        if cut >= 0:
+            tail = tail[:cut]
+    return (marker + tail).strip()[:limit]
+
+
+def _extract_flashback_pulse(episodic_ctx: str) -> str:
+    """Keep the probabilistic flashback section for a web delta."""
+    return _extract_memory_section(
+        episodic_ctx, "【突然浮现在脑海中的事】", limit=800
+    )
+
+
+def _extract_core_pulse(episodic_ctx: str) -> str:
+    """A compact identity anchor repeated in every web delta."""
+    return _extract_memory_section(
+        episodic_ctx, "【你一直放在心上的事】", limit=500
+    )
+
+
+def _recent_dialogue_pulse(messages: list[dict], limit: int = 4) -> str:
+    """Keep recent real dialogue, not repeated autonomous wake-up prompts."""
+    lines: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(part.get("text") or "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        text = str(content or "").strip()
+        role = str(message.get("role") or "user")
+        if not text:
+            continue
+        if role == "user" and (
+            text.lstrip().startswith("[系统提示")
+            or re.match(r"^\[[^\]]+ 结果\]", text)
+        ):
+            continue
+        lines.append(("用户" if role == "user" else "你") + "：" + text[:200])
+    return "\n".join(lines[-limit:])
+
+
+def _budgeted_web_pulse(parts: list[tuple[str, int]], limit: int = 2400) -> str:
+    """Reserve room for required current state before associative memories."""
+    kept: list[str] = []
+    used = 0
+    for text, budget in parts:
+        text = str(text or "").strip()
+        if not text:
+            continue
+        if len(text) > budget:
+            text = text[:budget].rstrip() + "\n…"
+        remaining = limit - used
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            text = text[:remaining].rstrip()
+        kept.append(text)
+        used += len(text)
+    return "\n\n".join(kept).strip()
+
+
+def _execution_receipt(name: str, result, *, body: bool = False) -> dict:
+    """Small executor-only evidence; never retain arguments, images or OCR text."""
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            result = {"summary": result}
+    data = result if isinstance(result, dict) else {}
+    raw_status = str(data.get("status") or "").lower()
+    error = bool(data.get("is_error") or data.get("isError")) or raw_status in {
+        "error", "failed", "failure", "denied", "blocked", "cancelled", "canceled",
+        "unsupported", "unavailable", "timeout",
+    }
+    applied = data.get("applied") is True and raw_status == "ok" and not error
+    status = "error" if error else (
+        "not_applied" if not data or raw_status == "not_applied"
+        or data.get("applied") is False or (body and not applied) else "ok"
+    )
+    # No payload excerpts: even a 'summary' may contain private screen text.
+    if body:
+        summary = "身体已确认执行" if applied else "身体动作未完成"
+        if applied:
+            facing = data.get("facing")
+            if facing in ("left", "right"):
+                summary += "；朝向=" + facing
+            coords = [data.get(axis) for axis in ("x", "y")]
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in coords):
+                summary += f"；位置=({coords[0]}, {coords[1]})"
+    elif name in ("capture_screen", "observe_screen"):
+        hint = str(data.get("summary") or "").lower()
+        if not error and name == "capture_screen" and "no vision channel" in hint:
+            status = "not_applied"
+        if status != "ok":
+            summary = "屏幕工具未完成；没有获得可用图像/解析结果"
+        elif name == "observe_screen":
+            summary = "屏幕解析工具返回结果；不是直接看见图像"
+        elif data.get("screenshot_base64"):
+            summary = "截图工具返回图像；不代表已经理解画面"
+        else:
+            summary = "视觉通道返回描述；不是当前模型直接看见图像"
+    elif name in ("pet_world_scout", "pet_world_bodies"):
+        summary = "窗口几何查询失败；没有获得图像" if error else "仅获取窗口几何/刚体列表，不是看见屏幕图像"
+    else:
+        summary = "工具执行失败" if error else "工具返回结果"
+    receipt = {"name": name, "kind": "body" if body else "tool", "status": status, "summary": summary}
+    if body:
+        receipt["applied"] = applied
+    return receipt
+
+
 async def _stream_chat_provider(
     registry: ProviderRegistry,
     mcp_manager: MCPManager,
@@ -4774,9 +6002,10 @@ async def _stream_chat_provider(
     conversation_dir: Optional[Path] = None,
 ) -> AsyncGenerator[bytes, None]:
     """Provider-based streaming chat with MCP tool support."""
-    global _last_real_user_ts
+    global _last_real_user_ts, _last_user_msg, _last_user_ts, _proactive_streak
     log = get_logger()
     turn_started = time.perf_counter()
+    _round_started_at = time.time()
     first_token_recorded = False
     telemetry.inc("chat.turns")
 
@@ -4787,6 +6016,18 @@ async def _stream_chat_provider(
     iteration = 0
     _tool_call_count = 0
     _inner_chars = 0
+    _d_summary = ""
+    _d_decision_text = ""
+    _round_receipts: list[dict] = []
+    _round_inner_parts: list[str] = []
+    _control_failure_pending = False
+    _control_feedback_sent = False
+    _iteration_surface: list[str] = []
+
+    def _record_receipt(name: str, result, *, body: bool = False) -> dict:
+        receipt = _execution_receipt(name, result, body=body)
+        _round_receipts.append(receipt)
+        return receipt
 
     def _emit(kind: str, title: str, text: str = "", **meta) -> None:
         try:
@@ -4804,11 +6045,111 @@ async def _stream_chat_provider(
     # One definition of "this is not a real user turn" for the whole round.
     # Proactive wake-ups, silent narration and empty requests are quiet: they
     # may legitimately end with no visible text.
-    _is_proactive = _real_user_turn_text(req) is None
-    # D may pick "quiet" on a proactive life round: the surface stays silent
-    # while the model still writes an inner voice. Set once the decision is
-    # applied; a real user turn is always forced to speak, so never here.
+    _user_turn_text = _real_user_turn_text(req)
+    _is_proactive = _user_turn_text is None
+    # ── 生命体征短路（强制停机 / 睡眠抑制 / 已死亡）──────────────────────
+    # Only the PROACTIVE path is blocked (sleeping / dead / discharged bodies
+    # don't tick on their own); real user turns always go through — point 5
+    # handles the wake ladder and death there. No provider call, no ledger
+    # tick, no drain: no work = no round.
+    _vitals0 = get_vitals()
+    if (
+        _vitals0 is not None
+        and not req.silent
+        and _user_turn_text is None
+        and (bool(_vitals0.forced_off) or bool(_vitals0.died) or bool(_vitals0.is_asleep()))
+    ):
+        if bool(_vitals0.died):
+            _sleep_state = "died"
+        elif bool(_vitals0.forced_off):
+            _sleep_state = "forced_off"
+        else:
+            _sleep_state = "asleep"
+        log.info(
+            "vitals short-circuit proactive round: died=%s forced_off=%s asleep=%s",
+            bool(_vitals0.died), bool(_vitals0.forced_off), bool(_vitals0.is_asleep()),
+        )
+        _emit("round_start", "轮开始", proactive=True, silent=False, messages=len(req.messages or []), model_provider=req.model_provider or "auto", user_text="", skipped="vitals")
+        _emit("round_end", "本轮结束", elapsed_ms=(time.perf_counter() - turn_started) * 1000.0, iterations=0, tools=0, provider=req.model_provider or "auto", generated=False, skipped="vitals")
+        # 机器事件替代可见气泡：睡着/停机/死亡期间每个主动拍不再弹出
+        # "（睡着了……）"文本（slow 节奏下 8 小时睡眠 ≈ 96 个气泡）。
+        # 渲染器消费 sleep_state {state} 显示一次性 💤/🔋 指示：状态不变
+        # 不重复，正常完成的轮次（不带该事件）让它自愈。未知事件在旧渲染
+        # 器上被安全忽略——不比旧行为差。
+        yield _sse({"event": "start"})
+        yield _sse({"event": "sleep_state", "state": _sleep_state})
+        yield _sse({"event": "end"})
+        return
+    # Capture receipt time before D/provider/tool awaits, not after generation.
+    # Life prompts and silent narration must never become the latest human.
+    if not req.silent and _user_turn_text:
+        _last_user_msg = _user_turn_text
+        _last_real_user_ts = _round_started_at
+        _last_user_ts = _round_started_at
+    _continuity_store = None if req.silent else _get_dstate_store()
+    # Set at the D-core fork below: this round was short-circuited BEFORE the
+    # provider by the vitals gate (asleep / forced-off / died on a proactive
+    # tick). A short-circuited tick is not a life round: no drain, no ledger
+    # tick, no ledger entry — the finally block reads this flag.
+    _vitals_short_circuited = False
+    # ── 上一轮 tick 留下的待办（点 7/9）──────────────────────────────
+    # organize_kind：上一轮 round_tick 刚跨过 500 的倍数 → 本轮（下一个
+    # 主动轮）变成记忆整理轮，读到即消费（本轮 finally 的 tick 会重写
+    # 这个槽位）。overflow：slow 溢出闩锁仍在 → 本轮升级休息提醒。
+    _pending_organize_kind: Optional[str] = (
+        str(_pending_vitals_round.get("organize_kind") or "") or None
+    )
+    _pending_overflow = bool(_pending_vitals_round.get("overflow"))
+    # Only a PROACTIVE round consumes the organize slot: a real user turn
+    # must be answered as asked — it neither runs the organize prompt nor
+    # clears the pending mark (the next proactive round picks it up; the
+    # finally's tick below never overwrites a still-pending slot).
+    if _pending_organize_kind and _user_turn_text is None:
+        _pending_vitals_round["organize_kind"] = None  # consumed by THIS round
+    if _continuity_store is not None and _user_turn_text:
+        try:
+            _continuity_store.note_user(_user_turn_text, _round_id, _round_started_at)
+            _continuity_store.save()
+        except Exception as exc:
+            _note_failure("continuity_note_user", exc)
+    # Thinking stays private; idle completes without resolving a provider.
     _quiet_life_turn = False
+    _d_tempo_mode = ""
+    _tempo_source = "derive"
+    # Per-round temperature base from the resolved tempo spec. None ⇒ the
+    # request's own temperature stands (see the chat_kwargs composition).
+    _tempo_base_temperature: Optional[float] = None
+    # Chat-mode entry (聊天节奏): a real user turn switches the AI to a
+    # faster tempo — "ultra" when another user turn arrived within the
+    # conversation gap (active dialogue), else "fast". Written into the
+    # tempo store with the normal TTL, so the NEXT rounds (including
+    # proactive ones) keep the cadence until it expires. Runs for every
+    # round shape, with or without a D store.
+    if _user_turn_text is not None:
+        _d_tempo_mode = _note_user_turn_for_tempo(time.time())
+        _tempo_source = "chat"
+        _DENSITY_STATE["last_user_turn_at"] = time.time()
+    elif not req.silent:
+        # Silent narration (narrator) is not a life round: it keeps the old
+        # no-tempo-event shape and its own temperature path.
+        _d_tempo_mode, _tempo_source = _resolve_tempo(time.time())
+    # An explicitly requested temperature (anything ≠ the ChatRequest
+    # default) outranks the tempo base: the caller asked for a specific
+    # sampling temperature, so no tempo/emotion reinterpretation happens.
+    try:
+        _explicit_temperature = (
+            float(req.temperature)
+            != float(ChatRequest.model_fields["temperature"].default)
+        )
+    except (TypeError, ValueError):
+        _explicit_temperature = False
+    # The resolved mode's temperature base applies to this round — including
+    # a chat-entry round (fast/ultra), unless the caller pinned a temperature.
+    if not _explicit_temperature:
+        try:
+            _tempo_base_temperature = float(_TEMPO_SPECS[_d_tempo_mode]["temp"])
+        except (KeyError, TypeError, ValueError):
+            _tempo_base_temperature = None
 
     _round_user_text = ""
     try:
@@ -4850,9 +6191,59 @@ async def _stream_chat_provider(
     _cortex_store = None
     _d_budget = None
     if not req.silent and _cortex_enabled():
-        _cortex_store = _get_dstate_store()
+        _cortex_store = _continuity_store
+    # ── 睡梦中的用户说话（吵醒阶梯；vitals 点 5）─────────────────────
+    # THE only user-wake entry. Each call = one 吵醒 = 1.0 HP damage and a
+    # sleep-plan multiplier inside the module; the reply goes out normally
+    # (allow_reply is always True), the episode simply continues with its
+    # extended plan. ``think`` (stage ≥ 2) overrides whatever D decides for
+    # this round; the stage-1 somatic line rides into the system prompt with
+    # the other context injections below.
+    _wake: Optional[dict] = None
+    if _vitals0 is not None and not req.silent:
+        try:
+            _wake = _vitals0.user_speech_wake()
+        except Exception as exc:
+            _note_failure("vitals_user_speech_wake", exc)
+            _wake = None
+        if _wake is not None:
+            req.thinking = bool(_wake.get("think"))
+            log.info(
+                "vitals: user speech wake (stage=%s think=%s hp=%.1f)",
+                _wake.get("stage"), bool(_wake.get("think")), _vitals0.hp,
+            )
+            try:
+                if _vitals0.died and _should_archive_death(_vitals0):
+                    _grave_dir = _vitals_state_dir()
+                    grave = _vitals0.graveyard_archive(
+                        _grave_dir
+                        if _grave_dir is not None
+                        else _default_memory_root()
+                    )
+                    # 入葬后换新台账：graveyard_archive 只重置磁盘上的
+                    # ledger.json（条目清空、seq/round_count 保留），内存
+                    # 单例仍握着旧灵魂的条目——下一次落账会把它们复活到
+                    # 磁盘。重建单例让它加载刚重置的文件，并清掉待办
+                    # organize 槽位（旧身体的记忆审查不属于新身体）。
+                    try:
+                        set_ledger(
+                            _Ledger(
+                                _grave_dir
+                                if _grave_dir is not None
+                                else _default_memory_root()
+                            )
+                        )
+                        _pending_vitals_round["organize_kind"] = None
+                        _pending_vitals_round["overflow"] = False
+                    except Exception as exc:
+                        _note_failure("ledger_fresh_after_grave", exc)
+                    log.warning(
+                        "vitals: 宠物死亡入葬 %s（记忆已归档，身体重置）", grave
+                    )
+                    _wake = None  # fresh body: this round runs as a normal user turn
+            except Exception as exc:
+                _note_failure("vitals_graveyard_archive", exc)
     if _cortex_store is not None:
-        _user_turn_text = _real_user_turn_text(req)
         _cortex_state = {
             "user_text": _user_turn_text or "",
             "is_proactive": _is_proactive,
@@ -4862,12 +6253,17 @@ async def _stream_chat_provider(
                 if _last_real_user_ts
                 else 0
             ),
-            "last_action": (_cortex_store.last_decision or {}).get("action", ""),
+            "now": time.time(),
+            "last_user": dict(_cortex_store.last_user or {}),
+            "last_round": dict(_cortex_store.last_round or {}),
+            "provider_type": "web" if (req.model_provider or "").lower() == "deepseek-web" else "fast",
         }
         _cortex_started = time.perf_counter()
         try:
             _decision = await _cortex.passive_decision(
-                _cortex_store, _cortex_state, timeout=CORTEX_DECISION_TIMEOUT
+                _cortex_store,
+                _cortex_state,
+                timeout=_cortex_round_timeout(_cortex_store, _is_proactive),
             )
             if not isinstance(_decision, dict):
                 raise TypeError("cortex decision is not a dict")
@@ -4890,18 +6286,16 @@ async def _stream_chat_provider(
 
         # A real user turn is a hard response obligation: never let the
         # default action "quiet" swallow the answer.
-        if not _is_proactive and _decision.get("action") == "quiet":
+        if not _is_proactive and _decision.get("action") in {"quiet", "think"}:
             _decision["action"] = "speak"
             _decision["action_label"] = "说"
             _decision["reason"] = (
                 str(_decision.get("reason") or "") + "|forced_speak:user_turn"
             )
 
-        # Quiet life round: proactive + D chose "quiet". Filters still run
-        # (INNER / DSTATE / control tags) and full_text still accumulates,
-        # but no visible delta reaches the surface.
+        # A thinking life round generates inner voice without visible speech.
         _quiet_life_turn = bool(
-            _is_proactive and (_decision.get("action") == "quiet")
+            _is_proactive and (_decision.get("action") == "think")
         )
 
         _decision["thinking"] = bool(_decision.get("thinking"))
@@ -4918,15 +6312,57 @@ async def _stream_chat_provider(
             _max_tokens = _cortex.REACTION_MAX_TOKENS[_decision["reaction"]]
         _decision["max_tokens"] = _max_tokens
 
+        # Reflex layer: on autonomous rounds, a reflex-weight S answer that is
+        # a clear body direction (left/right) moves the body directly, without
+        # waiting for the main model — a glance, not a decision. Never on a
+        # real user turn (that would be sleepwalking over the conversation).
+        if _is_proactive and _decision.get("action") != "quiet":
+            for _s in _decision.get("s_answers") or []:
+                if _s.get("weight") != "reflex":
+                    continue
+                _choice = str(_s.get("choice") or "").strip().lower()
+                _dir = _cortex.REFLEX_DIRECTIONS.get(_choice)
+                if _dir:
+                    try:
+                        _r = await _pet_action("turn", direction=_dir)
+                    except Exception:
+                        _r = {"status": "error", "applied": False}
+                    _record_receipt("reflex_turn", _r, body=True)
+                    if _r.get("status") == "ok" and _r.get("applied") is True:
+                        _s["applied"] = _dir
+                        _WORLD_VIEW_CACHE["t"] = 0.0
+                        _remember_body_action("turn", _r)
+
         req.thinking = _decision["thinking"]
         req.reasoning_effort = (
             _decision["reasoning_effort"] if req.thinking else None
         )
         req.max_new_tokens = _max_tokens
+        # Stage-1 吵醒强制不思考（点 5）：用户说话唤醒的优先级高于 D——
+        # 半梦半醒的身体没有余力进入深思考；stage ≥ 2 的 wake["think"]=True
+        # 已在 req.thinking 里，D 若也判 thinking 则保持。
+        if _wake is not None and not bool(_wake.get("think")):
+            req.thinking = False
+            req.reasoning_effort = None
         try:
             _d_confidence = float(_decision.get("confidence") or 0.0)
         except (TypeError, ValueError):
             _d_confidence = 0.0
+        # ── 节奏（tempo）本轮决议 ─────────────────────────────────────
+        # The store entry (model pet_set_tempo / chat entry, resolved above)
+        # already won or the resting cadence was derived — this is just the
+        # per-round audit log. Idle/reaction/action no longer steer tempo
+        # (fatigue/rest is a separate battery system's job).
+        _d_action = str(_decision.get("action") or "speak")
+        _d_reaction = str(_decision.get("reaction") or "medium")
+        try:
+            _d_idle = float((_cortex_state or {}).get("idle_sec") or 0.0)
+        except (TypeError, ValueError):
+            _d_idle = 0.0
+        log.info(
+            "cortex.tempo mode=%s source=%s idle=%.0fs reaction=%s action=%s",
+            _d_tempo_mode, _tempo_source, _d_idle, _d_reaction, _d_action,
+        )
         _d_budget = BudgetDecision(
             tier="cortex",
             thinking=req.thinking,
@@ -4938,14 +6374,33 @@ async def _stream_chat_provider(
         )
         log.info(
             "cortex.decision source=%s strength=%s reaction=%s action=%s "
-            "max_tokens=%d latency_ms=%.1f",
+            "max_tokens=%d latency_ms=%.1f reason=%s",
             _decision.get("source"),
             _decision.get("strength"),
             _decision.get("reaction"),
             _decision.get("action"),
             _max_tokens,
             _cortex_latency_ms,
+            _decision.get("reason") or "-",
         )
+        if _is_proactive:
+            if _decision.get("source") == "laya+prior":
+                _D_INTUITION_ALERT["streak"] = 0
+            elif _decision.get("source") == "prior":
+                _D_INTUITION_ALERT["streak"] += 1
+                if _D_INTUITION_ALERT["streak"] == 3:
+                    _reason = str(_decision.get("reason") or "-")
+                    log.warning(
+                        "D intuition unavailable for 3 life rounds: %s", _reason
+                    )
+                    _emit(
+                        "error",
+                        "直觉不可用",
+                        "Laya 直觉引擎连续 3 轮没有响应，生命轮只能保持安静。"
+                        "检查 Laya sidecar 是否在运行。",
+                        reason=_reason,
+                    )
+                    telemetry.inc("decision.cortex.laya_fallback")
         try:
             telemetry.inc("decision.cortex.total")
             telemetry.inc(
@@ -5004,7 +6459,7 @@ async def _stream_chat_provider(
             )
             _d_block = (
                 "\n\n【你的底层直觉状态（只用于行动，不要在回复里复述）】\n"
-                "上一轮生命总结（只给你的直觉，不是记忆；用它更新本轮 DSTATE）：\n"
+                "上一轮生命总结（主观想法，可能错；不是摄像头或执行事实；用它更新本轮 DSTATE）：\n"
                 f"{_d_summary}\n"
                 f"{_d_decision_text}\n"
                 "用户直接说话时必须回应；默认动作只是默认，你可以改。"
@@ -5013,11 +6468,194 @@ async def _stream_chat_provider(
         except Exception as exc:
             _note_failure("cortex_prompt_injection", exc)
 
+    # ── 快直觉 reflex 门（System 0）：主动轮的升级判定 ────────────────
+    # The gate covers EVERY proactive round (economics: D's non-quiet
+    # actions historically fire on ~46% of ticks — letting them wake the
+    # main brain directly empties the battery in half a day; the main
+    # round must become the scarce event). D still ran above (its
+    # bookkeeping incl. record_round ordering is preserved) and stays
+    # advisory; the tiny local LLM decides whether this tick is spent by
+    # the body alone (reflex-only quiet round) or wakes the main brain
+    # (fall through into the full pipeline). Skip conditions: real user
+    # turns, silent narration, rounds short-circuited by the vitals gate
+    # above (asleep / forced-off / died) and pending organize rounds —
+    # an organize round is main-brain by definition, the gate must not
+    # eat it. judge() NEVER raises and every failure comes back as
+    # source="fallback" quiet, so the gate cannot break a life tick.
+    # Reflex layer absent or disabled → nothing here runs: a D-quiet round
+    # falls through to the old early return right after this block, a
+    # D-non-quiet round proceeds to the main brain as today.
+    _reflex_decision: Optional[dict] = None
+    _rx_cfg = get_reflex_config()
+    _rx_gate_armed = (
+        _cortex_store is not None
+        and _is_proactive
+        and not _pending_organize_kind
+        and _rx_cfg is not None
+        and bool(_rx_cfg.enabled)
+    )
+    if _rx_gate_armed:
+        # Reflex state snapshot — only what is already in hand this round
+        # (D summary / idle / mood index / ledger fast entries). new_events
+        # stays 0: proactive rounds by definition have no fresh user
+        # message. The D advisory (d_action) is not a known prompt key
+        # (reflex.build_user_prompt serializes fixed lines only), so it is
+        # appended to the summary tail instead of passed as a custom key.
+        try:
+            _rx_mood_idx = float(
+                (mood_store.emotion_index if mood_store is not None else 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            _rx_mood_idx = 0.0
+        _rx_summary = str(_cortex_store.summary or "").strip()
+        _rx_advice = "；D 建议：" + str(_decision.get("action") or "quiet")
+        _rx_summary = (_rx_summary + _rx_advice) if _rx_summary else ("（暂无摘要）" + _rx_advice)
+        # 最近心声：取台账的 fast 条目（快直觉轮的一行记录）。安静轮不再
+        # 产瞬时记忆（D-quiet 在 provider 前短路；reflex-quiet 落的是台账
+        # fast），瞬时记忆在长安静期只会是空的/过期的——台账才是这颗心智
+        # 最近想过的东西。取最近 ≤3 条，按时间顺序。
+        _rx_thoughts: list = []
+        try:
+            _rx_lg_pre = get_ledger()
+            if _rx_lg_pre is not None:
+                _rx_thoughts = [
+                    t for t in (
+                        str(e.get("text") or "").strip()
+                        for e in _rx_lg_pre.entries()
+                        if e.get("kind") == "fast"
+                    ) if t
+                ][-3:]
+        except Exception:
+            _rx_thoughts = []
+        _reflex_state = {
+            "summary": _rx_summary,
+            "tempo_mode": _d_tempo_mode or "slow",
+            "new_events": 0,
+            "user_present": False,
+            "idle_s": _d_idle,
+            "mood": _mood_label_for_reflex(_rx_mood_idx),
+            "recent_thoughts": _rx_thoughts,
+            "d_action": str(_decision.get("action") or "quiet"),
+        }
+        _rx_started = time.perf_counter()
+        _reflex_decision = await _reflex_module.judge(
+            _reflex_state, _rx_cfg
+        )
+        _reflex_latency_s = (time.perf_counter() - _rx_started)
+        log.info(
+            "reflex tick action=%s think=%s next=%ss lat=%.1fs src=%s",
+            _reflex_decision.get("action"),
+            bool(_reflex_decision.get("think")),
+            _reflex_decision.get("next_check_s"),
+            _reflex_latency_s,
+            _reflex_decision.get("source"),
+        )
+        try:
+            telemetry.inc("reflex.ticks")
+            if _reflex_decision.get("source") == "fallback":
+                telemetry.inc("reflex.fallback")
+        except Exception:
+            pass
+        # Reflex-only round: the body keeps the tick AND stays silent —
+        # quiet action (or the unbreakable fallback quiet) with think=false.
+        # No provider, no main drain; the reflex layer bills its own small
+        # constant (prompt side ≈ system + state lines ≈ 300 tokens,
+        # completion side = config.max_tokens) and records ONE fast entry.
+        # The finally block does nothing for this round (_vitals_short_circuited).
+        if (
+            _reflex_decision.get("action") == "quiet"
+            and not bool(_reflex_decision.get("think"))
+        ):
+            _cortex_store.record_round(_round_id, _round_started_at, time.time(), True, "", "", _round_receipts)
+            _cortex_store.save()
+            _emit(
+                "quiet",
+                "静 · 快直觉安静轮",
+                hidden_chars=0,
+                reason="reflex",
+                generated=False,
+                reflex_action=_reflex_decision.get("action"),
+                reflex_source=_reflex_decision.get("source"),
+            )
+            _emit(
+                "round_end",
+                "本轮结束",
+                elapsed_ms=(time.perf_counter() - turn_started) * 1000.0,
+                iterations=0,
+                tools=0,
+                provider=req.model_provider or "auto",
+                generated=False,
+            )
+            telemetry.observe("chat.turn_seconds", time.perf_counter() - turn_started)
+            _vitals_short_circuited = True  # reflex-quiet: no provider, no life-round tick
+            yield _sse({"event": "start"})
+            yield _sse({"event": "tempo", "mode": _d_tempo_mode or "slow"})
+            yield _sse({
+                "event": "next_check_s",
+                "seconds": int(_reflex_decision.get("next_check_s") or 0),
+            })
+            yield _sse({"event": "quiet", "reason": "reflex"})
+            yield _sse({"event": "inner"})
+            yield _sse({"event": "end"})
+            # Small-round billing (intuition lane, ×0.5 multiplier inside
+            # vitals): the reflex request is ~300 prompt tokens (system
+            # prompt + state lines, measured shape) + max_tokens completion
+            # budget. One documented constant; the ledger gets exactly one
+            # fast line and the round ticks once.
+            try:
+                _rx_v = get_vitals()
+                if _rx_v is not None:
+                    _rx_tokens = 300 + int(get_reflex_config().max_tokens)
+                    _rx_v.drain_small(_rx_tokens)
+            except Exception as exc:
+                _note_failure("reflex_drain_small", exc)
+            try:
+                _rx_lg = get_ledger()
+                if _rx_lg is not None:
+                    _rx_lg.record_fast(
+                        f"{_reflex_decision.get('action')} "
+                        f"{_reflex_decision.get('reason') or ''}".strip()
+                    )
+                    _rx_lg.round_tick()
+            except Exception as exc:
+                _note_failure("reflex_ledger", exc)
+            return
+        # Reflex escalation (non-quiet action or think=true): fall through
+        # into the full pipeline below. D's quiet stays advisory in the
+        # prompt (its decision text was already injected into req.system),
+        # the provider runs and the existing finally block does the usual
+        # drain_main / round_tick / record_slow. _reflex_decision stays set
+        # and the next_check_s frame is emitted right before the pipeline's
+        # final end frame (see the tail of this generator).
+
+    if (
+        not _rx_gate_armed
+        and not _pending_organize_kind
+        and _cortex_store is not None
+        and _is_proactive
+        and _decision.get("action") == "quiet"
+    ):
+        # 旧世界（reflex 层缺席 / 停用）：主动 D-quiet 轮就地结束——
+        # no provider, no drain, no ledger tick, no fast entry, no judge.
+        # 待办整理轮不在此列：整理轮是主脑轮，必须落进完整管线。
+        _cortex_store.record_round(_round_id, _round_started_at, time.time(), True, "", "", _round_receipts)
+        _cortex_store.save()
+        _emit("quiet", "静 · 不生成念头", hidden_chars=0, reason="d_idle", generated=False)
+        _emit("round_end", "本轮结束", elapsed_ms=(time.perf_counter() - turn_started) * 1000.0,
+              iterations=0, tools=0, provider=req.model_provider or "auto", generated=False)
+        telemetry.observe("chat.turn_seconds", time.perf_counter() - turn_started)
+        _vitals_short_circuited = True  # D-quiet: no provider, no life-round tick
+        yield _sse({"event": "start"})
+        yield _sse({"event": "tempo", "mode": _d_tempo_mode or "slow"})
+        yield _sse({"event": "inner"})
+        yield _sse({"event": "end"})
+        return
+
     # 元直觉的第二座位：thinking 降级。必须在 _resolve_provider 之前——
     # LocalProvider 在构造时就吃 enable_thinking，晚了就改不动了。
     # D 在场时它只会覆盖 D 的判断，因此让位。
     _thinking_decision = None
-    if _cortex_store is None and not req.silent and req.thinking and req.messages:
+    if _cortex_store is None and not req.silent and req.thinking and req.messages and _wake is None:
         try:
             from .decision.meta import decide_thinking
             _last = req.messages[-1]
@@ -5037,6 +6675,15 @@ async def _stream_chat_provider(
     if not req.silent:
         bridge.new_session()
         bridge.post("thinking")
+
+    # Attention-density bookkeeping: this instant is "the last round" for
+    # the next one — body/tool receipts recorded after it count as fresh
+    # events. Kept failure-isolated: density is a temperature nudge, never
+    # worth breaking a round over.
+    try:
+        _DENSITY_STATE["last_round_at"] = time.time()
+    except Exception:
+        pass
 
     provider = _resolve_provider(registry, req, server, server_state, log, lora_arr)
     _provider_model = ""
@@ -5099,6 +6746,16 @@ async def _stream_chat_provider(
     # the core ones fit this provider".
     _tools_allowed = bool(getattr(provider, "allow_tools", True))
     _core_only = bool(req.tools_enabled and not _tools_allowed)
+    # ── 记忆整理轮（点 7）：audit 保留核心记忆工具；recap 零工具 ──
+    # 收窄请求本身（tools_enabled=False）让 _gather_tools 直接返回 None；
+    # audit 用 core_only 的名字集合过滤。只对主动轮生效：真实用户轮在
+    # 待办整理期间必须拿到完整的工具名单（用户不能被整理轮降级）。
+    if _pending_organize_kind == "recap" and _user_turn_text is None:
+        req.tools_enabled = False
+        log.info("ledger: recap organize round — tools disabled for this round")
+    elif _pending_organize_kind == "audit" and _user_turn_text is None:
+        _core_only = True
+        log.info("ledger: audit organize round — core memory tools only")
     if _core_only:
         log.info("provider %s: heavy tools disabled; core soul tools only", provider.name)
         tools_list = await _gather_tools(mcp_manager, req, core_only=True)
@@ -5111,6 +6768,17 @@ async def _stream_chat_provider(
     # alias when the bare name is unambiguous (see _build_tool_map).
     _tool_map = _build_tool_map(tools_list)
 
+    # 记忆整理轮（点 7）：audit 的工具名单收窄到核心记忆工具（在
+    # _core_only 全集之上再过滤，屏幕/桌面/骰子工具都不进这轮）。
+    # 只对主动轮生效（用户轮保持完整名单，见上面的收窄守卫）。
+    if _pending_organize_kind == "audit" and tools_list and _user_turn_text is None:
+        tools_list = [t for t in tools_list if t.name in _ORGANIZE_AUDIT_TOOLS]
+        _tool_map = _build_tool_map(tools_list)
+        log.info(
+            "ledger: audit organize round tools=%s",
+            [t.name for t in tools_list],
+        )
+
     # Helper: check whether the current provider+model can process image
     # inputs. Must match capture_screen's own capability check — same
     # shared function, so the tool and the result-attachment path cannot
@@ -5120,10 +6788,12 @@ async def _stream_chat_provider(
         return provider_can_see_images(provider, server)
 
     yield _sse({"event": "start"})
+    if _d_tempo_mode:
+        yield _sse({"event": "tempo", "mode": _d_tempo_mode})
 
-    # LingLing v3: a conversation is happening — un-freeze memory decay.
-    global _proactive_streak
-    _conversation_state["last_conversation_at"] = datetime.now(timezone.utc)
+    # Background life is not a human conversation; sleep/dream use human idle.
+    if _real_user_turn_text(req) is not None:
+        _conversation_state["last_conversation_at"] = datetime.now(timezone.utc)
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
@@ -5148,17 +6818,6 @@ async def _stream_chat_provider(
         if isinstance(_c0, str):
             _user_text_for_log = _c0
 
-    # 决策层状态：最近用户消息 + 时间戳（元直觉/习惯直觉用）
-    global _last_user_msg, _last_user_ts
-    if _user_text_for_log:
-        _last_user_msg = _user_text_for_log
-        _last_user_ts = __import__("time").time()
-        # Proactive wake-ups and silent narrator calls are not user
-        # replies: only a real user turn invalidates the decision loop's
-        # intuition pressure.
-        if not req.silent and not _user_text_for_log.startswith(_PROACTIVE_PROMPT_PREFIX):
-            _last_real_user_ts = _last_user_ts
-
     # 关键词闪现（第三层，最低概率）：在瞬忆注入之前写入，本轮就能看见。
     if _user_text_for_log and _ephemeral_ref is not None:
         try:
@@ -5173,6 +6832,15 @@ async def _stream_chat_provider(
             _note_failure("keyword_flash", exc)
 
     system = req.system
+    # Reused web chats only receive the latest user delta, so the memory
+    # context (flashback / resonance / DSTATE) that normally lives in the
+    # system prompt would never reach the model after the first turn. This
+    # short pulse travels beside the delta and is injected by the bridge.
+    _web_pulse_parts: list[str] = []
+    if _d_decision_text:
+        _web_pulse_parts.append("【当前的直觉提议】" + _d_decision_text)
+    if _d_summary.strip():
+        _web_pulse_parts.append("【主观生命总结（可能错，不是执行/视觉事实）】" + _d_summary.strip()[:240])
 
     # ── 决策层闪念注入：瞬时记忆 + 身体日志（让 LLM 知情，不梦游）──
     try:
@@ -5180,16 +6848,19 @@ async def _stream_chat_provider(
             _eph_text = _ephemeral_ref.format_for_prompt()
             if _eph_text:
                 system = (system or "") + "\n\n" + _eph_text
+                _web_pulse_parts.append(_eph_text[:700])
         if _body_log_ref is not None:
             _bl_text = _body_log_ref.format_for_prompt()
             if _bl_text:
                 system = (system or "") + "\n\n" + _bl_text
+                _web_pulse_parts.append(_bl_text[:400])
         # 视锥：只把"看得见"的刚体告诉它，而不是整张桌面。
         try:
             await _world_bodies_for_decision()
             _vision_text = _format_vision_context()
             if _vision_text:
                 system = (system or "") + "\n\n" + _vision_text
+                _web_pulse_parts.append(_vision_text[:400])
         except Exception:
             pass
     except Exception:
@@ -5213,6 +6884,17 @@ async def _stream_chat_provider(
             )
             if episodic_ctx and active_event_store.event_count() > 0:
                 system = (system or "") + "\n\n" + episodic_ctx
+                _recent_pulse = _extract_memory_section(
+                    episodic_ctx, "【你记得的事】", limit=450
+                )
+                if _recent_pulse:
+                    _web_pulse_parts.append(_recent_pulse)
+                _core_pulse = _extract_core_pulse(episodic_ctx)
+                if _core_pulse:
+                    _web_pulse_parts.append(_core_pulse)
+                _flash_pulse = _extract_flashback_pulse(episodic_ctx)
+                if _flash_pulse:
+                    _web_pulse_parts.append(_flash_pulse)
 
             # 1.5 Continuity of self (持续自我存在): the same self, continuously
             #     existing. The body changed; the self did not — the system
@@ -5235,7 +6917,8 @@ async def _stream_chat_provider(
         body_lines = [
             "【身体与进化】你的身体可以自己移动：在回复里输出 [WALK:dx,dy]"
             "（屏幕像素增量，可负值，一条回复可以多个，身体会依次走过去），"
-            "输出 [WALK_DESKTOP] 会跳到另一个虚拟桌面。"
+            "输出 [WALK_DESKTOP] 会跳到另一个虚拟桌面；输出 [TURN:left] 或 [TURN:right] "
+            "只转头看另一侧（视锥跟着转，身体不动）。"
             "这些标签会被身体执行，不会显示给用户。",
             "【心声】你有两种说话方式：开口（默认——正常回复，用户能看到），"
             "或者在心里想（心声）。选择心声时，把这一轮的全部输出写成一个大标签"
@@ -5274,8 +6957,8 @@ async def _stream_chat_provider(
             # made the model call pet_world_scout when the user said
             # "look at my screen".
             body_lines = [
-                "【身体】可输出 [WALK:dx,dy] 移动、[WALK_DESKTOP] 换桌面、"
-                "[INNER:...] 心声；这些标签不会显示给用户。",
+                "【身体】可输出 [WALK:dx,dy] 移动、[TURN:left] 或 [TURN:right] "
+                "转头看另一侧、[WALK_DESKTOP] 换桌面、[INNER:...] 心声；这些标签不会显示给用户。",
                 "【看屏幕】要“看屏幕/截图/看我在干嘛”用 "
                 "[MCP:builtin/capture_screen:{}]；截图会作为图片附件上传到网页。"
                 "需要点击坐标用 [MCP:builtin/observe_screen:{}]；"
@@ -5293,6 +6976,66 @@ async def _stream_chat_provider(
                 "直接用文字回答。记忆块 <<<MEM>>> 仍然照常输出。"
             )
 
+        # ── 记忆整理轮（点 7）：换掉这一轮的普通 LIFE_PROMPT ──
+        # 审查轮 / 总结轮的指令由上一轮 round_tick 的 mark 指定；工具名单
+        # 已在上面收窄。这一轮的可见回复由 finally 里的 record_organize
+        # 落账（recap 额外 set_recap）。只在主动轮生效：真实用户消息必须
+        # 原样回答，绝不能被整理轮劫持——槽位保持 pending，等下一个主动
+        # 轮再消费（finally 的 tick 也不会覆盖它）。
+        if _pending_organize_kind and _user_turn_text is None:
+            system = (system or "") + "\n\n" + _ORGANIZE_PROMPTS.get(
+                _pending_organize_kind,
+                _ORGANIZE_PROMPTS["audit"],
+            )
+            if _pending_organize_kind == "recap":
+                # 回顾材料：最近 100 轮的生命台账（快/主脑混排，一行一条）
+                # 附在指令之后。审查轮不用台账材料（它用核心记忆工具）。
+                _recap_lines = _recent_ledger_lines(get_ledger(), 100)
+                if _recap_lines:
+                    system = (
+                        (system or "")
+                        + "\n\n【最近 100 轮生命台账】\n"
+                        + "\n".join(_recap_lines)
+                    )
+
+        # ── 睡梦吵醒的身体感受（点 5）──
+        if _wake is not None and str(_wake.get("somatic") or ""):
+            system = (system or "") + "\n\n【身体此刻的感受】" + str(_wake["somatic"])
+
+        # ── 上次的回顾（点 8）：真实用户轮一次性附上 ──
+        if _user_turn_text is not None and not req.silent and get_ledger() is not None:
+            try:
+                _recap_text = get_ledger().consume_recap()
+            except Exception as exc:
+                _note_failure("ledger_consume_recap", exc)
+                _recap_text = None
+            if _recap_text:
+                system = (
+                    (system or "")
+                    + "\n\n【你上次的回顾】\n"
+                    + str(_recap_text)
+                )
+
+        # ── 休息提醒（点 9）：电量低 / slow 溢出，主动轮和用户轮都提醒 ──
+        _vitals_warn = get_vitals()
+        if _vitals_warn is not None:
+            try:
+                if _pending_overflow:
+                    system = (
+                        (system or "")
+                        + "\n\n【系统提示：你的身体因为过度劳累开始清理旧的记忆了。"
+                        "停下一切活动，休息。】"
+                    )
+                elif _vitals_warn.should_warn():
+                    system = (
+                        (system or "")
+                        + "\n\n【系统提示：你的电量剩余 "
+                        + f"{_vitals_warn.percent():.1f}"
+                        + "%——连续工作太久会强制停机。考虑减少活动，必要时早点休息。】"
+                    )
+            except Exception as exc:
+                _note_failure("vitals_rest_reminder", exc)
+
         # 3. Resonance: check if the user's latest message triggers stored events
         if active_event_store is not None and messages:
             last_msg = messages[-1]
@@ -5307,10 +7050,40 @@ async def _stream_chat_provider(
                 if resonance_hits:
                     # v2: felt-language + time annotation (this is a memory
                     # surfacing, not a database hit).
-                    system = (system or "") + _organ_service("resonance", _resonance_module).build_resonance_block(resonance_hits)
+                    _resonance_block = _organ_service(
+                        "resonance", _resonance_module
+                    ).build_resonance_block(resonance_hits)
+                    system = (system or "") + _resonance_block
+                    _web_pulse_parts.append(_resonance_block.strip())
     except Exception as exc:
         _count_failure("context_injection")   # greppable forensics anchor
         log.warning("LingLing context injection failed (continuing): %s", exc)
+
+    _recent_dialogue = ""
+    try:
+        _recent_dialogue = _recent_dialogue_pulse(messages[:-1])
+        if _recent_dialogue:
+            _web_pulse_parts.insert(0, "【最近对话】\n" + _recent_dialogue)
+        from .memory.files import get_memory_files
+        _memory_files = get_memory_files()
+        _main_memory = _memory_files.read_main().strip() if _memory_files is not None else ""
+        if _main_memory:
+            _web_pulse_parts.insert(1, "【你的主记忆】\n" + _main_memory[:500])
+    except Exception:
+        pass
+
+    if _is_proactive and not req.silent and messages:
+        if _recent_dialogue:
+            system = (system or "") + "\n\n【此前已发生的对话（不是本轮新消息）】\n" + _recent_dialogue
+        messages = messages[-1:]
+
+    _web_memory_pulse = _budgeted_web_pulse([
+        (_web_pulse_parts[0] if _web_pulse_parts else "", 500),
+        (_web_pulse_parts[1] if len(_web_pulse_parts) > 1 else "", 400),
+        *[(part, 450) for part in _web_pulse_parts[2:]],
+    ])
+    if _web_memory_pulse:
+        _emit("memory", "记忆脉冲", _web_memory_pulse, chars=len(_web_memory_pulse))
 
     cw = getattr(provider, "_context_window", None) or req.context_window
     if cw and isinstance(cw, int) and cw > 0:
@@ -5344,24 +7117,40 @@ async def _stream_chat_provider(
     # B-1: strip [EMOTION:…]/[NEXT_CHAT:…] control tags mid-stream so the
     # renderer's typewriter never flashes them. The renderer keeps its own
     # sanitize pass as defense-in-depth. [WALK…] body-commands are captured
-    # here and re-emitted as body-command SSE events (身体自己走路).
-    _walk_queue: list[dict] = []
+    # Body actions are queued here until the stream boundary can await an
+    # actual Electron result. SSE deltas never execute a second copy in the UI.
+    _walk_queue: list[tuple[str, dict]] = []
 
     def _on_walk_control(kind: str, dx: int | None, dy: int | None) -> None:
+        if _control_feedback_sent:
+            return
         if kind == "walk":
-            _walk_queue.append({"event": "walk", "dx": dx, "dy": dy})
-            try:
-                if _body_log_ref is not None:
-                    _body_log_ref.append("walk", f"dx={dx}, dy={dy}", source="intent")
-            except Exception:
-                pass
+            _walk_queue.append(("walk", {"dx": dx, "dy": dy}))
+        elif str(kind).startswith("turn:"):
+            _walk_queue.append(("turn", {"direction": str(kind).split(":", 1)[1]}))
         else:
-            _walk_queue.append({"event": "walk_desktop"})
-            try:
-                if _body_log_ref is not None:
-                    _body_log_ref.append("walk_desktop", "", source="intent")
-            except Exception:
-                pass
+            _walk_queue.append(("desktop", {}))
+
+    async def _drain_body_actions():
+        nonlocal _control_failure_pending
+        while _walk_queue:
+            kind, payload = _walk_queue.pop(0)
+            if req.silent:
+                continue
+            if kind == "desktop":
+                result = {"status": "not_applied", "applied": False}
+            else:
+                try:
+                    result = await _pet_action(kind, **payload)
+                except Exception:
+                    result = {"status": "error", "applied": False}
+            receipt = _record_receipt(kind, result, body=True)
+            if receipt["status"] != "ok":
+                _control_failure_pending = True
+            if result.get("status") == "ok" and result.get("applied") is True:
+                _WORLD_VIEW_CACHE["t"] = 0.0
+                _remember_body_action(kind, result)
+            yield _sse({"event": "body_action", "kind": kind, **result})
 
     # 心声 (inner voice): the model wrapped its whole reply in [INNER:…] —
     # it chose to THINK this instead of SAYING it. The filter suppressed
@@ -5376,6 +7165,7 @@ async def _stream_chat_provider(
         if not content:
             return
         _inner_queue.append({"event": "inner"})
+        _round_inner_parts.append(content)
         _inner_chars += len(content)
         _emit("inner", "心声", content, chars=len(content))
         try:
@@ -5390,6 +7180,10 @@ async def _stream_chat_provider(
     # Hidden DSTATE block: swallow it mid-stream so it never flashes on
     # screen while the main LLM writes the next rolling summary.
     dstate_filter = DStateFilter()
+    memory_filter = DStateFilter("<<<MEM>>>", "<<<MEMEND>>>")
+    # Hallucinated native tool markup (a degenerating model repeats it) is
+    # hidden wholesale, exactly like a DSTATE block.
+    tool_markup_filter = DStateFilter("<tool_call>", "</tool_call>")
     accumulated_full_text: list[str] = []
     full_text = ""
 
@@ -5403,6 +7197,7 @@ async def _stream_chat_provider(
         nonlocal _speech_probe, _speech_probe_visible_len
         if not clean:
             return
+        _iteration_surface.append(clean)
         _speech_probe += clean
         visible = _visible_reply_text(_speech_probe)
         if len(visible) > _speech_probe_visible_len:
@@ -5436,13 +7231,50 @@ async def _stream_chat_provider(
     # reasoning and each tool-call iteration (用户: 时间一定是实时会变化，
     # 变化就在模型进行说话的时候).
     def _refresh_now_anchor(sys_text: str) -> str:
-        now = datetime.now(timezone.utc).strftime("%Y年%m月%d日 %H:%M:%S")
+        now = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
         return _NOW_ANCHOR_RE.sub(f"（现在是{now}。", sys_text, count=1)
+
+    _base_system = system or ""
+
+    def _refresh_round_context() -> tuple[str, str]:
+        now = time.time()
+        facts = (
+            _cortex.format_continuity(_continuity_store, now, _is_proactive)
+            if _continuity_store is not None else ""
+        )
+        clock = datetime.fromtimestamp(now).strftime("%Y年%m月%d日 %H:%M:%S")
+        facts = f"【实时系统事实】现在是{clock}。\n" + facts
+        facts += "\n生命总结、S 答案和心声是主观内容，可能错；窗口几何不等于屏幕图像。"
+        receipts = ""
+        if _round_receipts:
+            receipts = "【本轮执行器回执（不是意图）】\n" + "\n".join(
+                f"- {r['name']}: {r['status']}；{r['summary']}"
+                for r in _round_receipts[-12:]
+            )
+        life = ""
+        if _is_proactive and not req.silent:
+            life = (
+                "【当前 LIFE_PROMPT（自动唤醒信号）】\n"
+                + _user_text_for_log[:1200]
+                + "\n这是你自己的自动续流，本轮没有新用户话。"
+                "历史中的已回应对话不是待回答的新消息，不要重新回答旧用户话；"
+                "只有系统事实标为未回应的真人话仍待回应。"
+            )
+        live = "\n\n".join(part for part in (facts, receipts, life) if part)
+        # Rebuild from the static base: ages never freeze or accumulate across tools.
+        refreshed = _refresh_now_anchor(_base_system) + "\n\n" + live
+        # Never truncate away a failure receipt or the LIFE_PROMPT guard to
+        # make room for associative memory. Persisted evidence is already small.
+        memory = _budgeted_web_pulse([(_web_memory_pulse, 1000)], limit=max(0, 4800 - len(live)))
+        pulse = live + ("\n\n" + memory if memory else "")
+        return refreshed, pulse
 
     # Diagnostic: prompt size vs. budget. A cold local prefill of the full
     # persona/skill block can take minutes, and the old log only showed a
     # 300-char preview — useless when a 2B model "suddenly stops". This is
-    # the line to ask for in a bug report.
+    # the line to ask for in a bug report. ``_vitals_prompt_tokens`` reuses
+    # THIS estimate for the battery drain (点 2).
+    _vitals_prompt_tokens = 0
     try:
         _ctx_window = getattr(provider, "_context_window", None) or req.context_window
         _msg_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
@@ -5476,10 +7308,19 @@ async def _stream_chat_provider(
         )
     except Exception as exc:
         log.debug("prompt budget log failed: %s", exc)
+        _vitals_prompt_tokens = 0
+    else:
+        _vitals_prompt_tokens = _prompt_tokens
 
     # One syntax-correction retry per turn: quantized models mangle the
     # tool-call syntax (dropped "MCP:" prefix, quotes instead of {}).
     _tool_syntax_retry_done = False
+
+    # ── 生命体征/台账：本轮账单（点 2/6）────────────────────────────
+    # tokens = 复用 prompt-budget 日志的那份估算 + 全部迭代累计的 completion；
+    # 由外层 try/finally 在轮结束时一次性 drain + round_tick + record_slow。
+    _vitals_completion_tokens = 0
+    _round_temperature = float(req.temperature)  # finally fallback (pre-loop)
 
     # Reasoning text streamed in the CURRENT iteration. Native tool calls
     # carry their own reasoning_content (set by the provider); text [MCP:]
@@ -5487,598 +7328,794 @@ async def _stream_chat_provider(
     # attached to the assistant tool_calls message (DeepSeek thinking mode
     # rejects the follow-up round otherwise).
     round_reasoning = ""
+    _think_chunk_buf: list[str] = []
+    _think_last_emit = time.monotonic()
 
-    while True:
-        iteration += 1
-        tool_occurred = False
-        last_round_had_tools = False
-        round_reasoning = ""
-
-        if not req.silent:
-            bridge.post("working")
-
-        # Save previous iteration's text before reset
-        if full_text.strip():
-            accumulated_full_text.append(full_text)
-        full_text = ""
-        pending_tool_calls: list[dict] = []
-
-        # Determine parameters based on provider type
-        effective_max = _output_budget(provider, req, _d_budget)
-        # Live now-anchor: refreshed right before the model speaks (every
-        # iteration), so after long reasoning / tool calls the model still
-        # knows what time it is right now.
-        system = _refresh_now_anchor(system or "")
-
-        chat_kwargs = {
-            "messages": messages,
-            "system": system,
-            "tools": tools_list,
-            "max_tokens": effective_max,
-            # Emotion index modulates temperature (happy → more divergent,
-            # sad → more subdued). Applied per iteration so tool-call
-            # follow-ups also carry the current emotional temperature.
-            "temperature": modulate_temperature(
-                req.temperature,
-                mood_store.emotion_index if mood_store is not None else 0.0,
-            ),
-            "top_p": req.top_p,
-        }
-        if provider.name == "local":
-            chat_kwargs["top_k"] = req.top_k
-            chat_kwargs["repetition_penalty"] = req.repetition_penalty
-        # Per-request thinking/effort only for the OpenAI-compatible provider
-        # (providers.json defaults are static and would otherwise force max
-        # thinking on every cloud call). Local/Anthropic must not receive
-        # unknown kwargs.
-        if isinstance(provider, OpenAIProvider):
-            chat_kwargs["thinking_override"] = bool(req.thinking)
-            chat_kwargs["reasoning_effort_override"] = (
-                req.reasoning_effort if req.thinking else None
-            )
-
-        # A mid-round pet_enter_slow upgrade must expose reasoning events
-        # from the next generation on (the filter was built at round start).
-        if hasattr(think_filter, "expose"):
-            think_filter.expose = bool(req.thinking)
-
-        try:
-            async for event in provider.chat(**chat_kwargs):
-                if event["type"] in ("delta", "think") and not first_token_recorded:
-                    first_token_recorded = True
-                    telemetry.observe(
-                        "chat.first_token_seconds", time.perf_counter() - turn_started
-                    )
-                    _emit(
-                        "first_token",
-                        "首 token",
-                        elapsed_ms=(time.perf_counter() - turn_started) * 1000.0,
-                        max_tokens=effective_max,
-                    )
-                if event["type"] == "delta":
-                    full_text += event["content"]
-                    for ev in think_filter.feed(event["content"]):
-                        if ev.get("event") == "delta":
-                            clean = dstate_filter.feed(
-                                narration_filter.feed(tag_filter.feed(ev["content"]))
-                            )
-                            clean = _INLINE_TOOL_MARKER_RE.sub("", clean)
-                            while _walk_queue:
-                                yield _sse(_walk_queue.pop(0))
-                            while _inner_queue:
-                                yield _sse(_inner_queue.pop(0))
-                            if clean and _quiet_life_turn:
-                                # Quiet life round: the filters still ran
-                                # (INNER/control/DSTATE captured, full_text
-                                # accumulated) but the surface stays silent.
-                                clean = ""
-                            if clean:
-                                _note_visible_delta(clean)
-                                yield _sse({"event": "delta", "content": clean})
-                        else:
-                            yield _sse(ev)
-                elif event["type"] == "think":
-                    round_reasoning += event.get("content", "")
-                    _emit(
-                        "think",
-                        "思考",
-                        event.get("content", ""),
-                        provider=provider.name,
-                    )
-                    yield _sse({"event": "think", "content": event["content"]})
-                elif event["type"] == "tool_call":
-                    if not _tools_allowed:
-                        event_name = event.get("name", "")
-                        resolved_name = _tool_map.get(event_name, ("", event_name))[1]
-                        core_names = {t.name for t in (tools_list or [])}
-                        if resolved_name not in core_names:
-                            log.warning("Ignoring non-core tool call from %s: %s", provider.name, event_name)
-                            continue
-                    event["source"] = "native"
-                    pending_tool_calls.append(event)
-                    tool_occurred = True
-                    tool_used_this_turn = True
-                elif event["type"] == "error":
-                    telemetry.inc("chat.errors")
-                    log.warning("provider %s error: %s", provider.name, event["message"])
-                    _emit("error", "错误", event["message"])
-                    yield _sse({"event": "error", "message": event["message"]})
-                    if not req.silent:
-                        bridge.post("error")
-                    _release_active_provider()
-                    return
-                elif event["type"] == "end":
-                    break
-        except Exception as exc:
-            telemetry.inc("chat.errors")
-            log.exception("provider chat error: %s", exc)
-            _emit("error", "错误", str(exc))
-            yield _sse({"event": "error", "message": str(exc)})
-            if not req.silent:
-                bridge.post("error")
-            _release_active_provider()
+    def _flush_think(*, force: bool = False) -> None:
+        nonlocal _think_last_emit
+        text = "".join(_think_chunk_buf)
+        if not text:
             return
-
-        # Check for [MCP:] markers in text output. This runs for ALL
-        # providers as a fallback — cloud models (DeepSeek, Qwen API)
-        # often output tool calls as text instead of using the API's
-        # native function-calling mechanism. The legacy allow-tools path
-        # keeps its unconditional behaviour; core-only parsing is enabled
-        # by the (non-empty) core tool list and filtered below.
-        if not pending_tool_calls and (_tools_allowed or tools_list):
-            raw_mcp_calls = parse_mcp_calls(full_text)
-            mcp_calls = raw_mcp_calls
-            if _core_only:
-                core_names = {t.name for t in (tools_list or [])}
-                mcp_calls = [mc for mc in mcp_calls if mc.get("name") in core_names]
-            if mcp_calls and mcp_manager:
-                tool_occurred = True
-                tool_used_this_turn = True
-                for mc in mcp_calls:
-                    pending = {
-                        "type": "tool_call",
-                        "id": f"mcp_{mc['server_name']}_{mc['name']}",
-                        "server_name": mc["server_name"],
-                        "name": mc["name"],
-                        "arguments": mc["arguments"],
-                        "source": "text",
-                    }
-                    # The text path is a reconstructed assistant turn: the
-                    # visible text is the [MCP:] marker, the reasoning came
-                    # from this round's think events. Both must round-trip.
-                    if round_reasoning:
-                        pending["reasoning_content"] = round_reasoning
-                    pending_tool_calls.append(pending)
-            elif not raw_mcp_calls and ("[builtin/" in full_text or "[MCP:" in full_text):
-                # A marker is present but nothing parsed. Never end the turn
-                # silently — that reads as "the pet froze".
-                log.warning(
-                    "tool marker present but unparsed; raw tail=%r",
-                    full_text[-220:],
-                )
-                # Give the model one correction shot with the canonical form
-                # spelled out, instead of dropping the turn.
-                if not _tool_syntax_retry_done:
-                    _tool_syntax_retry_done = True
-                    # The example must be a tool this provider can actually
-                    # run: in core-only mode capture_screen is filtered out,
-                    # so "fixing" the format would still get the call ignored.
-                    if _core_only:
-                        _correction_example = '[MCP:builtin/memory:{"action":"list"}]'
-                    else:
-                        _correction_example = "[MCP:builtin/capture_screen:{}]"
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "[系统] 你刚才的工具调用格式有误，没有被识别。"
-                            "正确格式是：方括号 + MCP: 前缀 + server/工具名 + 冒号 + 花括号 JSON（参数为空就写 {}，"
-                            "不要用引号、不要省略 MCP:）。例如：\n"
-                            f"{_correction_example}\n"
-                            "请只重新输出这一行，不要解释。"
-                        ),
-                    })
-                    tool_occurred = True
-                    tool_used_this_turn = True
-                    continue
-
-        if not tool_occurred:
-            break
-
-        last_round_had_tools = True
-
-        # Execute pending tool calls. Arm the silent streak only HERE, when
-        # the first tool of a run is about to execute; long prefill or
-        # thinking before the first tool is not silent tool activity. From
-        # then on the clock stays armed across consecutive calls until the
-        # model says something the user can actually see. It is checked
-        # before EVERY tool: a tool that just took ages must not be
-        # followed by a second one while the user still has not heard a
-        # word.
-        if pending_tool_calls:
-            if tool_streak_started_at is None:
-                tool_streak_started_at = _monotonic()
-            for tc in pending_tool_calls:
-                _now = _monotonic()
-                if silent_tool_timed_out(
-                    tool_streak_started_at, _now, _silent_tool_budget
-                ):
-                    _note_silent_timeout("before_tool", _now)
-                    break
-                tn = tc.get("name", "")
-                if not tn:
-                    continue
-                # Resolve server name from tool name map
-                sn = tc.get("server_name", "default")
-                if tn in _tool_map:
-                    sn, tn = _tool_map[tn]
-                elif sn == "default":
-                    # Try to find matching tool across all servers
-                    log.warning("Unresolved tool call: %s, trying call_tool_by_name", tn)
-                args = tc.get("arguments", {})
-                tc_id = tc.get("id", "")
-
-                if tn == "recall":
-                    recall_calls_this_turn += 1
-
-                try:
-                    _tool_args_text = json.dumps(
-                        args, ensure_ascii=False, default=str
-                    )
-                except Exception:
-                    _tool_args_text = str(args)
-                _tool_started = time.perf_counter()
-                _emit(
-                    "tool_call",
-                    f"工具 · {tn}",
-                    _tool_args_text,
-                    tool=tn,
-                    server=sn,
-                    iteration=iteration,
-                )
-
-                log.info(
-                    "MCP tool call: source=%s name=%s/%s reasoning_chars=%d args=%s",
-                    tc.get("source", "native"),
-                    sn,
-                    tn,
-                    len(tc.get("reasoning_content") or ""),
-                    args,
-                )
-
-                # Tell the chat surface BEFORE running the tool. A tool can
-                # take tens of seconds (screenshot upload, OCR cold start,
-                # plugin compile); without this the bubble stays empty until
-                # the follow-up model turn and reads as "the pet froze".
-                if not _quiet_life_turn:
-                    yield _sse({
-                        "event": "delta",
-                        "content": f"\n_执行 {tn}..._\n",
-                    })
-
-                # Plugin tools (自进化器官) don't produce the multimodal dict
-                # the screenshot extraction below expects — default to None so
-                # a pet/recall turn doesn't die on UnboundLocalError after the
-                # model already answered.
-                result = None
-                _mgr = _kernel()
-                if tn == "pet_enter_slow":
-                    # Slow-intuition upgrade (same round). Handled by bare
-                    # name too, even when the builtin lookup is ambiguous.
-                    result = await _enter_slow_tool(args)
-                    summary = result.get("summary") or f"[Tool {tn} completed]"
-                    _slow_strength = str(args.get("strength") or "low").strip().lower()
-                    if _slow_strength not in ("low", "high", "max"):
-                        _slow_strength = "low"
-                    _emit(
-                        "slow",
-                        "慢直觉",
-                        _slow_strength,
-                        strength=_slow_strength,
-                    )
-                elif tn == "pet_decision":
-                    # Active D gut check; never mutates/saves the store.
-                    result = await _decision_tool(args)
-                    summary = result.get("summary") or f"[Tool {tn} completed]"
-                elif sn == "pet-intuition":
-                    # 自创直觉（内置工具；代码走 plugin_policy 策略闸）
-                    result_text = _intuition_tool(tn, args)
-                    summary = result_text or f"[Tool {tn} completed]"
-                elif sn == "pet-world":
-                    # 桌面刚体工具（内置，不受插件沙箱限制）
-                    result_text = await _world_tool(tn, args)
-                    summary = result_text or f"[Tool {tn} completed]"
-                elif _mgr is not None and (sn == "pet" or tn in _mgr.all_tools()):
-                    # plugin tool (自进化器官) — executed by the container
-                    result_text = await _mgr.call_tool(tn, args)
-                    summary = result_text or f"[Tool {tn} completed]"
-                else:
-                    result = await mcp_manager.call_tool(sn, tn, args)
-                    summary = result.get("summary", f"[Tool {tn} completed]")
-
-                _tool_elapsed_ms = (time.perf_counter() - _tool_started) * 1000.0
-                _tool_error = (
-                    bool(result.get("is_error"))
-                    if isinstance(result, dict)
-                    else False
-                )
-                _tool_call_count += 1
-                _emit(
-                    "tool_result",
-                    f"结果 · {tn}",
-                    summary,
-                    tool=tn,
-                    is_error=_tool_error,
-                    elapsed_ms=_tool_elapsed_ms,
-                    iteration=iteration,
-                )
-
-                # Add to message context for next iteration
-                if provider.supports_function_calling and tc_id:
-                    is_anthropic = isinstance(provider, AnthropicProvider)
-                    if is_anthropic:
-                        prefixed = f"mcp_{_sanitize(sn)}_{_sanitize(tn)}"
-                        messages.append({
-                            "role": "assistant",
-                            "content": [{
-                                "type": "tool_use",
-                                "id": tc_id,
-                                "name": prefixed,
-                                "input": args,
-                            }],
-                        })
-                    else:
-                        assistant_msg = {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [{
-                                "id": tc_id,
-                                "type": "function",
-                                "function": {"name": tn, "arguments": json.dumps(args)},
-                            }],
-                        }
-                        # DeepSeek thinking mode requires the exact reasoning
-                        # text next to the tool_calls; omitting it makes the
-                        # follow-up round fail with HTTP 400.
-                        reasoning_content = tc.get("reasoning_content")
-                        if reasoning_content:
-                            assistant_msg["reasoning_content"] = reasoning_content
-                        messages.append(assistant_msg)
-                else:
-                    messages.append({"role": "assistant", "content": f"[{tn}]"})
-                # Build tool result content — multimodal if provider can see images
-                screenshot_b64 = result.get("screenshot_base64") if isinstance(result, dict) else None
-                screenshot_mime = (
-                    (result.get("screenshot_mime") if isinstance(result, dict) else None)
-                    or "image/png"
-                )
-                if screenshot_b64 and _can_see_images():
-                    # For local providers (no function calling), use 'user' role
-                    # because llama-server doesn't process images in 'tool' role
-                    # messages. Anthropic/OpenAI handle tool role images natively.
-                    if provider.supports_function_calling:
-                        tool_content = [
-                            {"type": "text", "text": summary},
-                            {"type": "image_url", "image_url": {"url": f"data:{screenshot_mime};base64,{screenshot_b64}"}},
-                        ]
-                        messages.append({
-                            "role": "tool",
-                            "content": tool_content,
-                            "tool_call_id": tc_id or f"call_{tn}",
-                            "name": tn,
-                        })
-                    else:
-                        # Local model: inject as a user message with image content
-                        messages.append({
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": f"[{tn} 结果]\n{summary}"},
-                                {"type": "image_url", "image_url": {"url": f"data:{screenshot_mime};base64,{screenshot_b64}"}},
-                            ],
-                        })
-                elif provider.supports_function_calling:
-                    messages.append({
-                        "role": "tool",
-                        "content": summary,
-                        "tool_call_id": tc_id or f"call_{tn}",
-                        "name": tn,
-                    })
-                else:
-                    # Local / non-function-calling models: llama-server does
-                    # not understand role:"tool" here. The result never lands
-                    # in the prompt, the follow-up generation comes back
-                    # empty, `tool_occurred` stays false and the turn dies
-                    # after exactly one iteration — the model appears to
-                    # "call a tool and stop", which reads as the pet having
-                    # no autonomy at all. Feed it back as a user turn with an
-                    # explicit marker instead.
-                    messages.append({
-                        "role": "user",
-                        "content": f"[{tn} 结果]\n{summary}",
-                    })
-
-                # Recall loop guard: past the soft limit, pin an explicit
-                # instruction into the context. The model kept retrying because
-                # a probabilistic miss literally says "you almost got it", so
-                # the nudge must name the tool and forbid another attempt.
-                if (
-                    tn == "recall"
-                    and recall_calls_this_turn >= RECALL_SOFT_LIMIT
-                    and not recall_limit_notified
-                ):
-                    recall_limit_notified = True
-                    messages.append({"role": "user", "content": RECALL_LIMIT_NOTICE})
-
-                # Brief notification to client. Tool execution itself is
-                # never suppressed; only its visible narration is.
-                # (The "执行 …" line is already yielded before execution;
-                # repeating it here would append a second status line.)
-
-        if _silent_timeout_hit:
-            break
-
-        # End-of-round check: tool execution itself may have consumed the
-        # whole silent budget. Do not start another (possibly slow) model
-        # round before forcing the answer. No streak (no tool ran) means
-        # this round was just model thinking — never a timeout.
-        _now = _monotonic()
-        if tool_streak_started_at is not None and silent_tool_timed_out(
-            tool_streak_started_at, _now, _silent_tool_budget
+        now = time.monotonic()
+        if (
+            not force
+            and len(text) < THINK_EVENT_MIN_CHARS
+            and now - _think_last_emit < THINK_EVENT_MIN_SECS
         ):
-            _note_silent_timeout("round_end", _now)
-            break
+            return
+        _think_chunk_buf.clear()
+        _think_last_emit = now
+        _emit("think", "思考", text, provider=provider.name, chars=len(text))
 
-        # This round's reasoning was consumed while building the assistant
-        # tool_calls messages; never carry it into the next round.
-        round_reasoning = ""
+    try:
+      while True:
+          iteration += 1
+          tool_occurred = False
+          last_round_had_tools = False
+          round_reasoning = ""
 
-    # ── Forced final answer when the tool loop must stop ────────────────
-    # Two ways in: (1) the only hard rule — a fully silent tool streak
-    # (SILENT_TOOL_TIMEOUT_SECONDS with no visible reply between calls);
-    # (2) the model called tools but its last round produced only pipeline
-    # chatter (MEM block / control tags) and no visible body. Either way the
-    # renderer would otherwise receive only "_执行 …_" status lines and
-    # collapse the bubble — to the user the pet "disappeared mid-task".
-    # Ask once more with tools=None so it must answer from results it has.
-    _final_is_inner = bool(
-        re.search(r"\[\s*INNER\s*:", full_text or "", re.IGNORECASE)
-    )
-    _force_final = _silent_timeout_hit or (
-        tool_used_this_turn
-        and not _final_is_inner
-        and (last_round_had_tools or not _visible_reply_text(full_text))
-    )
-    if _force_final:
-        if _silent_timeout_hit:
-            log.warning(
-                "chat.silent_tool_timeout: forcing a tools=None final answer "
-                "(iterations=%d, recalls=%d)",
-                iteration,
-                recall_calls_this_turn,
-            )
-        else:
-            telemetry.inc("chat.tool_loop_cap")
-            log.warning(
-                "tool loop ended without a visible final answer "
-                "(iterations=%d, recalls=%d); forcing a tools=None reply",
-                iteration,
-                recall_calls_this_turn,
-            )
-        _final_notice = (
-            "[系统] 你已经连续调用工具 %.0f 分钟没有回答用户，"
-            "请基于现有结果直接回答，不要继续调用工具。"
-            % max(1.0, _silent_tool_budget / 60.0)
-            if _silent_timeout_hit
-            else (
-                "[系统] 请基于上面的工具结果，"
-                "直接用一两句话回答用户；不要再调用工具。"
-            )
-        )
-        messages.append({"role": "user", "content": _final_notice})
-        _catchup_temperature = modulate_temperature(
-            req.temperature,
-            mood_store.emotion_index if mood_store is not None else 0.0,
-        )
-        _catchup_kwargs = {
-            "messages": messages,
-            "system": _refresh_now_anchor(system or ""),
-            "tools": None,
-            "max_tokens": 768,
-            "temperature": _catchup_temperature,
-            "top_p": req.top_p,
-        }
-        if provider.name == "local":
-            _catchup_kwargs["top_k"] = req.top_k
-            _catchup_kwargs["repetition_penalty"] = req.repetition_penalty
-        if isinstance(provider, OpenAIProvider):
-            _catchup_kwargs["thinking_override"] = bool(req.thinking)
-            _catchup_kwargs["reasoning_effort_override"] = (
-                req.reasoning_effort if req.thinking else None
-            )
-        _catchup_text = ""
-        if hasattr(think_filter, "expose"):
-            think_filter.expose = bool(req.thinking)
+          if not req.silent:
+              bridge.post("working")
+
+          # Save previous iteration's text before reset
+          if full_text.strip():
+              accumulated_full_text.append(full_text)
+          full_text = ""
+          _iteration_surface = []
+          if _tool_call_count:
+              _control_failure_pending = False
+          pending_tool_calls: list[dict] = []
+
+          # Determine parameters based on provider type
+          effective_max = _output_budget(provider, req, _d_budget)
+          # Live now-anchor: refreshed right before the model speaks (every
+          # iteration), so after long reasoning / tool calls the model still
+          # knows what time it is right now.
+          system, _live_web_pulse = _refresh_round_context()
+
+          # Temperature composition: tempo base (节奏温度) + emotion modulation
+          # + attention-density nudge, clamped to [TEMP_MIN, TEMP_MAX]. An
+          # explicitly requested temperature (anything ≠ the ChatRequest
+          # default 0.6) is respected verbatim: it is a caller instruction,
+          # not a mood to be re-interpreted. Silent narration keeps the plain
+          # request temperature (no tempo/emotion reinterpretation).
+          if _tempo_base_temperature is None:
+              _round_temperature = float(req.temperature)
+          else:
+              _emotion = mood_store.emotion_index if mood_store is not None else 0.0
+              _round_temperature = max(
+                  TEMP_MIN,
+                  min(
+                      TEMP_MAX,
+                      modulate_temperature(_tempo_base_temperature, _emotion)
+                      + (_density_delta(time.time()) if not req.silent else 0.0),
+                  ),
+              )
+
+          chat_kwargs = {
+              "messages": messages,
+              "system": system,
+              "tools": None if _control_feedback_sent else tools_list,
+              "max_tokens": effective_max,
+              # Reused web sessions also need live clocks and failure receipts.
+              "web_state": _live_web_pulse,
+              "tools_enabled": req.tools_enabled,
+              "temperature": _round_temperature,
+              "top_p": req.top_p,
+          }
+          if req.tools_enabled is False:
+              chat_kwargs["tools_enabled"] = False
+          if provider.name == "local":
+              chat_kwargs["top_k"] = req.top_k
+              chat_kwargs["repetition_penalty"] = req.repetition_penalty
+          # Per-request thinking/effort only for the OpenAI-compatible provider
+          # (providers.json defaults are static and would otherwise force max
+          # thinking on every cloud call). Local/Anthropic must not receive
+          # unknown kwargs.
+          if isinstance(provider, OpenAIProvider):
+              chat_kwargs["thinking_override"] = bool(req.thinking)
+              chat_kwargs["reasoning_effort_override"] = (
+                  req.reasoning_effort if req.thinking else None
+              )
+
+          # A mid-round pet_enter_slow upgrade must expose reasoning events
+          # from the next generation on (the filter was built at round start).
+          if hasattr(think_filter, "expose"):
+              think_filter.expose = bool(req.thinking)
+
+          try:
+              async for event in provider.chat(**chat_kwargs):
+                  if event["type"] in ("delta", "think") and not first_token_recorded:
+                      first_token_recorded = True
+                      telemetry.observe(
+                          "chat.first_token_seconds", time.perf_counter() - turn_started
+                      )
+                      _emit(
+                          "first_token",
+                          "首 token",
+                          elapsed_ms=(time.perf_counter() - turn_started) * 1000.0,
+                          max_tokens=effective_max,
+                      )
+                  if event["type"] == "delta":
+                      full_text += event["content"]
+                      _vitals_completion_tokens += _estimate_tokens(
+                          event.get("content") or ""
+                      )
+                      for ev in think_filter.feed(event["content"]):
+                          if ev.get("event") == "delta":
+                              # Summary JSON is subjective state, not an action
+                              # channel: hide it BEFORE interpreting body/INNER tags.
+                              clean = narration_filter.feed(
+                                  tag_filter.feed(tool_markup_filter.feed(memory_filter.feed(dstate_filter.feed(ev["content"]))))
+                              )
+                              clean = _INLINE_TOOL_MARKER_RE.sub("", clean)
+                              async for action_event in _drain_body_actions():
+                                  yield action_event
+                              while _inner_queue:
+                                  yield _sse(_inner_queue.pop(0))
+                              if clean and _control_failure_pending and not _control_feedback_sent:
+                                  clean = ""
+                              if clean and _quiet_life_turn:
+                                  # Quiet life round: the filters still ran
+                                  # (INNER/control/DSTATE captured, full_text
+                                  # accumulated) but the surface stays silent.
+                                  clean = ""
+                              if clean:
+                                  _note_visible_delta(clean)
+                                  yield _sse({"event": "delta", "content": clean})
+                          else:
+                              yield _sse(ev)
+                  elif event["type"] == "think":
+                      round_reasoning += event.get("content", "")
+                      _think_chunk_buf.append(event.get("content", ""))
+                      _flush_think()
+                      yield _sse({"event": "think", "content": event["content"]})
+                  elif event["type"] == "tool_call":
+                      if _control_feedback_sent:
+                          continue
+                      if not _tools_allowed:
+                          event_name = event.get("name", "")
+                          resolved_name = _tool_map.get(event_name, ("", event_name))[1]
+                          core_names = {t.name for t in (tools_list or [])}
+                          if resolved_name not in core_names:
+                              log.warning("Ignoring non-core tool call from %s: %s", provider.name, event_name)
+                              continue
+                      event["source"] = "native"
+                      pending_tool_calls.append(event)
+                      tool_occurred = True
+                      tool_used_this_turn = True
+                  elif event["type"] == "error":
+                      telemetry.inc("chat.errors")
+                      log.warning("provider %s error: %s", provider.name, event["message"])
+                      _emit("error", "错误", event["message"])
+                      yield _sse({"event": "error", "message": event["message"]})
+                      if not req.silent:
+                          bridge.post("error")
+                      _release_active_provider()
+                      return
+                  elif event["type"] == "end":
+                      _flush_think(force=True)
+                      break
+          except Exception as exc:
+              telemetry.inc("chat.errors")
+              log.exception("provider chat error: %s", exc)
+              _emit("error", "错误", str(exc))
+              yield _sse({"event": "error", "message": str(exc)})
+              if not req.silent:
+                  bridge.post("error")
+              _release_active_provider()
+              return
+
+          if _control_failure_pending and not _control_feedback_sent and not pending_tool_calls:
+              _control_feedback_sent = True
+              _control_failure_pending = False
+              rejected = _visible_reply_text(full_text)
+              if rejected:
+                  messages.append({"role": "assistant", "content": rejected})
+              messages.append({
+                  "role": "user",
+                  "content": "[系统：身体执行回执，不是新的用户消息]\n"
+                  + json.dumps(_round_receipts, ensure_ascii=False)
+                  + "\n身体动作没有完成。刚才的成功描述不能当作事实；根据回执完成本轮回应和 DSTATE，"
+                  "不要再次执行身体命令。",
+              })
+              if _iteration_surface:
+                  accumulated_full_text.append("".join(_iteration_surface))
+              tag_filter = ControlTagFilter(on_control=_on_walk_control, on_inner=_on_inner)
+              narration_filter = ToolNarrationFilter()
+              dstate_filter = DStateFilter()
+              memory_filter = DStateFilter("<<<MEM>>>", "<<<MEMEND>>>")
+              tool_markup_filter = DStateFilter("<tool_call>", "</tool_call>")
+              full_text = ""
+              continue
+
+          # Check for [MCP:] markers in text output. This runs for ALL
+          # providers as a fallback — cloud models (DeepSeek, Qwen API)
+          # often output tool calls as text instead of using the API's
+          # native function-calling mechanism. The legacy allow-tools path
+          # keeps its unconditional behaviour; core-only parsing is enabled
+          # by the (non-empty) core tool list and filtered below.
+          if not _control_feedback_sent and not pending_tool_calls and (_tools_allowed or tools_list):
+              _tool_parse_text = _cortex.strip_dstate_blocks(full_text)
+              _tool_parse_text = re.sub(r"<<<(DSTATE|MEM)>>>[\s\S]*?(?:<<<\1END>>>|$)", "", _tool_parse_text, flags=re.IGNORECASE)
+              raw_mcp_calls = parse_mcp_calls(_tool_parse_text)
+              mcp_calls = raw_mcp_calls
+              if _core_only:
+                  core_names = {t.name for t in (tools_list or [])}
+                  mcp_calls = [mc for mc in mcp_calls if mc.get("name") in core_names]
+              if mcp_calls and mcp_manager:
+                  tool_occurred = True
+                  tool_used_this_turn = True
+                  for mc in mcp_calls:
+                      pending = {
+                          "type": "tool_call",
+                          "id": f"mcp_{mc['server_name']}_{mc['name']}",
+                          "server_name": mc["server_name"],
+                          "name": mc["name"],
+                          "arguments": mc["arguments"],
+                          "source": "text",
+                      }
+                      # The text path is a reconstructed assistant turn: the
+                      # visible text is the [MCP:] marker, the reasoning came
+                      # from this round's think events. Both must round-trip.
+                      if round_reasoning:
+                          pending["reasoning_content"] = round_reasoning
+                      pending_tool_calls.append(pending)
+              elif not raw_mcp_calls and ("[builtin/" in _tool_parse_text or "[MCP:" in _tool_parse_text):
+                  # A marker is present but nothing parsed. Never end the turn
+                  # silently — that reads as "the pet froze".
+                  log.warning(
+                      "tool marker present but unparsed; raw tail=%r",
+                      full_text[-220:],
+                  )
+                  # Give the model one correction shot with the canonical form
+                  # spelled out, instead of dropping the turn.
+                  if not _tool_syntax_retry_done:
+                      _tool_syntax_retry_done = True
+                      # The example must be a tool this provider can actually
+                      # run: in core-only mode capture_screen is filtered out,
+                      # so "fixing" the format would still get the call ignored.
+                      if _core_only:
+                          _correction_example = '[MCP:builtin/memory:{"action":"list"}]'
+                      else:
+                          _correction_example = "[MCP:builtin/capture_screen:{}]"
+                      messages.append({
+                          "role": "user",
+                          "content": (
+                              "[系统] 你刚才的工具调用格式有误，没有被识别。"
+                              "正确格式是：方括号 + MCP: 前缀 + server/工具名 + 冒号 + 花括号 JSON（参数为空就写 {}，"
+                              "不要用引号、不要省略 MCP:）。例如：\n"
+                              f"{_correction_example}\n"
+                              "请只重新输出这一行，不要解释。"
+                          ),
+                      })
+                      tool_occurred = True
+                      tool_used_this_turn = True
+                      continue
+
+          if not tool_occurred:
+              break
+
+          last_round_had_tools = True
+
+          # Execute pending tool calls. Arm the silent streak only HERE, when
+          # the first tool of a run is about to execute; long prefill or
+          # thinking before the first tool is not silent tool activity. From
+          # then on the clock stays armed across consecutive calls until the
+          # model says something the user can actually see. It is checked
+          # before EVERY tool: a tool that just took ages must not be
+          # followed by a second one while the user still has not heard a
+          # word.
+          if pending_tool_calls:
+              if tool_streak_started_at is None:
+                  tool_streak_started_at = _monotonic()
+              for tc in pending_tool_calls:
+                  _now = _monotonic()
+                  if silent_tool_timed_out(
+                      tool_streak_started_at, _now, _silent_tool_budget
+                  ):
+                      _note_silent_timeout("before_tool", _now)
+                      break
+                  tn = tc.get("name", "")
+                  if not tn:
+                      continue
+                  # Resolve server name from tool name map
+                  sn = tc.get("server_name", "default")
+                  if tn in _tool_map:
+                      sn, tn = _tool_map[tn]
+                  elif sn == "default":
+                      # Try to find matching tool across all servers
+                      log.warning("Unresolved tool call: %s, trying call_tool_by_name", tn)
+                  args = tc.get("arguments", {})
+                  tc_id = tc.get("id", "")
+
+                  if tn == "recall":
+                      recall_calls_this_turn += 1
+
+                  try:
+                      _tool_args_text = json.dumps(
+                          args, ensure_ascii=False, default=str
+                      )
+                  except Exception:
+                      _tool_args_text = str(args)
+                  _tool_started = time.perf_counter()
+                  _emit(
+                      "tool_call",
+                      f"工具 · {_tool_label(tn)}",
+                      _tool_args_text,
+                      tool=tn,
+                      server=sn,
+                      iteration=iteration,
+                  )
+
+                  log.info(
+                      "MCP tool call: source=%s name=%s/%s reasoning_chars=%d args=%s",
+                      tc.get("source", "native"),
+                      sn,
+                      tn,
+                      len(tc.get("reasoning_content") or ""),
+                      args,
+                  )
+
+                  # Tell the chat surface BEFORE running the tool. A tool can
+                  # take tens of seconds (screenshot upload, OCR cold start,
+                  # plugin compile); without this the bubble stays empty until
+                  # the follow-up model turn and reads as "the pet froze".
+                  if not _quiet_life_turn:
+                      _label = _tool_label(tn)
+                      yield _sse({
+                          "event": "delta",
+                          "content": f"\n_执行 {_label}..._\n",
+                      })
+
+                  # Plugin tools (自进化器官) don't produce the multimodal dict
+                  # the screenshot extraction below expects — default to None so
+                  # a pet/recall turn doesn't die on UnboundLocalError after the
+                  # model already answered.
+                  result = None
+                  _mgr = _kernel()
+                  try:
+                      if tn == "pet_enter_slow":
+                          result = await _enter_slow_tool(args)
+                          summary = result.get("summary") or f"[Tool {tn} completed]"
+                          _slow_strength = str(args.get("strength") or "low").strip().lower()
+                          if _slow_strength not in ("low", "high", "max"):
+                              _slow_strength = "low"
+                          _emit("slow", "慢直觉", _slow_strength, strength=_slow_strength)
+                      elif tn == "pet_decision":
+                          result = await _decision_tool(args)
+                          summary = result.get("summary") or f"[Tool {tn} completed]"
+                      elif tn == "pet_set_tempo":
+                          _mode = str(args.get("mode") or "").strip().lower()
+                          if _mode not in _TEMPO_MODES:
+                              # Invalid mode falls back to the resting cadence.
+                              _mode = _TEMPO_DEFAULT
+                          _set_tempo(_mode, "model")
+                          summary = (
+                              f"反应节奏：{_TEMPO_SPECS[_mode]['label']}"
+                              "（约10分钟后回落）"
+                          )
+                          yield _sse({"event": "tempo", "mode": _mode})
+                      elif tn == "pet_turn_head":
+                          _direction = str(args.get("direction") or "right").strip().lower()
+                          if _direction not in ("left", "right"):
+                              _direction = "right"
+                          _turn_result = await _pet_action("turn", direction=_direction)
+                          if _turn_result.get("status") == "ok" and _turn_result.get("applied") is True:
+                              summary = f"已转头看向{_direction}。"
+                              _WORLD_VIEW_CACHE["t"] = 0.0
+                              _remember_body_action("turn", _turn_result)
+                          else:
+                              summary = "转头没有完成：" + str(_turn_result.get("message") or "身体未确认")
+                          result = dict(_turn_result, summary=summary)
+                          yield _sse({"event": "body_action", "kind": "turn", **_turn_result})
+                      elif sn == "pet-intuition":
+                          result = _intuition_tool(tn, args)
+                          summary = result or f"[Tool {tn} completed]"
+                      elif sn == "pet-world":
+                          result = await _world_tool(tn, args)
+                          summary = result or f"[Tool {tn} completed]"
+                      elif sn == "pet-evolve":
+                          result = await _evolve_tool(tn, args)
+                          summary = result or f"[Tool {tn} completed]"
+                      elif _mgr is not None and (sn == "pet" or tn in _mgr.all_tools()):
+                          result = await _mgr.call_tool(tn, args)
+                          summary = result or f"[Tool {tn} completed]"
+                      else:
+                          result = await mcp_manager.call_tool(sn, tn, args)
+                          summary = result.get("summary", f"[Tool {tn} completed]")
+                  except Exception as exc:
+                      log.warning("tool %s failed: %s", tn, exc)
+                      summary = f"工具 {tn} 执行失败（{type(exc).__name__}）"
+                      result = {"status": "error", "is_error": True, "summary": summary}
+
+                  _tool_elapsed_ms = (time.perf_counter() - _tool_started) * 1000.0
+                  _receipt = _record_receipt(
+                      tn, result,
+                      body=tn in {"pet_turn_head", "pet_world_walk_to"},
+                  )
+                  _tool_error = _receipt["status"] != "ok"
+                  _tool_call_count += 1
+                  _emit(
+                      "tool_result",
+                      f"结果 · {_tool_label(tn)}",
+                      summary,
+                      tool=tn,
+                      is_error=_tool_error,
+                      elapsed_ms=_tool_elapsed_ms,
+                      iteration=iteration,
+                  )
+                  if not _quiet_life_turn:
+                      # The bubble showed "_执行 X..._" before the call; close
+                      # the loop with the outcome so failures are never silent.
+                      _label = _tool_label(tn)
+                      _status_text = str(summary or "").strip().replace("\n", " ")[:120]
+                      _status_line = (
+                          f"✗ {_label} 失败：{_status_text}"
+                          if _tool_error
+                          else f"✓ {_label} 完成"
+                      )
+                      yield _sse({"event": "delta", "content": f"\n{_status_line}_\n"})
+
+                  # Add to message context for next iteration
+                  if provider.supports_function_calling and tc_id:
+                      is_anthropic = isinstance(provider, AnthropicProvider)
+                      if is_anthropic:
+                          prefixed = f"mcp_{_sanitize(sn)}_{_sanitize(tn)}"
+                          messages.append({
+                              "role": "assistant",
+                              "content": [{
+                                  "type": "tool_use",
+                                  "id": tc_id,
+                                  "name": prefixed,
+                                  "input": args,
+                              }],
+                          })
+                      else:
+                          assistant_msg = {
+                              "role": "assistant",
+                              "content": None,
+                              "tool_calls": [{
+                                  "id": tc_id,
+                                  "type": "function",
+                                  "function": {"name": tn, "arguments": json.dumps(args)},
+                              }],
+                          }
+                          # DeepSeek thinking mode requires the exact reasoning
+                          # text next to the tool_calls; omitting it makes the
+                          # follow-up round fail with HTTP 400.
+                          reasoning_content = tc.get("reasoning_content")
+                          if reasoning_content:
+                              assistant_msg["reasoning_content"] = reasoning_content
+                          messages.append(assistant_msg)
+                  else:
+                      messages.append({"role": "assistant", "content": f"[{tn}]"})
+                  # Build tool result content — multimodal if provider can see images
+                  screenshot_b64 = result.get("screenshot_base64") if isinstance(result, dict) else None
+                  screenshot_mime = (
+                      (result.get("screenshot_mime") if isinstance(result, dict) else None)
+                      or "image/png"
+                  )
+                  _feedback = (
+                      f"[执行回执: {_receipt['status']}] {_receipt['summary']}\n"
+                      + _tool_feedback_text(result, summary)
+                  )
+                  if screenshot_b64 and _can_see_images():
+                      # For local providers (no function calling), use 'user' role
+                      # because llama-server doesn't process images in 'tool' role
+                      # messages. Anthropic/OpenAI handle tool role images natively.
+                      if provider.supports_function_calling:
+                          tool_content = [
+                              {"type": "text", "text": _feedback},
+                              {"type": "image_url", "image_url": {"url": f"data:{screenshot_mime};base64,{screenshot_b64}"}},
+                          ]
+                          messages.append({
+                              "role": "tool",
+                              "content": tool_content,
+                              "tool_call_id": tc_id or f"call_{tn}",
+                              "name": tn,
+                          })
+                      else:
+                          # Local model: inject as a user message with image content
+                          messages.append({
+                              "role": "user",
+                              "content": [
+                                  {"type": "text", "text": f"[{tn} 结果]\n{_feedback}"},
+                                  {"type": "image_url", "image_url": {"url": f"data:{screenshot_mime};base64,{screenshot_b64}"}},
+                              ],
+                          })
+                  elif provider.supports_function_calling:
+                      messages.append({
+                          "role": "tool",
+                          "content": _feedback,
+                          "tool_call_id": tc_id or f"call_{tn}",
+                          "name": tn,
+                      })
+                  else:
+                      # Local / non-function-calling models: llama-server does
+                      # not understand role:"tool" here. The result never lands
+                      # in the prompt, the follow-up generation comes back
+                      # empty, `tool_occurred` stays false and the turn dies
+                      # after exactly one iteration — the model appears to
+                      # "call a tool and stop", which reads as the pet having
+                      # no autonomy at all. Feed it back as a user turn with an
+                      # explicit marker instead.
+                      messages.append({
+                          "role": "user",
+                          "content": f"[{tn} 结果]\n{_feedback}",
+                      })
+
+                  # Recall loop guard: past the soft limit, pin an explicit
+                  # instruction into the context. The model kept retrying because
+                  # a probabilistic miss literally says "you almost got it", so
+                  # the nudge must name the tool and forbid another attempt.
+                  if (
+                      tn == "recall"
+                      and recall_calls_this_turn >= RECALL_SOFT_LIMIT
+                      and not recall_limit_notified
+                  ):
+                      recall_limit_notified = True
+                      messages.append({"role": "user", "content": RECALL_LIMIT_NOTICE})
+
+                  # Brief notification to client. Tool execution itself is
+                  # never suppressed; only its visible narration is.
+                  # (The "执行 …" line is already yielded before execution;
+                  # repeating it here would append a second status line.)
+
+          if _silent_timeout_hit:
+              break
+
+          # End-of-round check: tool execution itself may have consumed the
+          # whole silent budget. Do not start another (possibly slow) model
+          # round before forcing the answer. No streak (no tool ran) means
+          # this round was just model thinking — never a timeout.
+          _now = _monotonic()
+          if tool_streak_started_at is not None and silent_tool_timed_out(
+              tool_streak_started_at, _now, _silent_tool_budget
+          ):
+              _note_silent_timeout("round_end", _now)
+              break
+
+          # This round's reasoning was consumed while building the assistant
+          # tool_calls messages; never carry it into the next round.
+          round_reasoning = ""
+
+      # ── Forced final answer when the tool loop must stop ────────────────
+      # Two ways in: (1) the only hard rule — a fully silent tool streak
+      # (SILENT_TOOL_TIMEOUT_SECONDS with no visible reply between calls);
+      # (2) the model called tools but its last round produced only pipeline
+      # chatter (MEM block / control tags) and no visible body. Either way the
+      # renderer would otherwise receive only "_执行 …_" status lines and
+      # collapse the bubble — to the user the pet "disappeared mid-task".
+      # Ask once more with tools=None so it must answer from results it has.
+      _final_is_inner = bool(
+          re.search(r"\[\s*INNER\s*:", full_text or "", re.IGNORECASE)
+      )
+      _force_final = _silent_timeout_hit or (
+          tool_used_this_turn
+          and not _final_is_inner
+          and (last_round_had_tools or not _visible_reply_text(full_text))
+      )
+      if _force_final:
+          if _silent_timeout_hit:
+              log.warning(
+                  "chat.silent_tool_timeout: forcing a tools=None final answer "
+                  "(iterations=%d, recalls=%d)",
+                  iteration,
+                  recall_calls_this_turn,
+              )
+          else:
+              telemetry.inc("chat.tool_loop_cap")
+              log.warning(
+                  "tool loop ended without a visible final answer "
+                  "(iterations=%d, recalls=%d); forcing a tools=None reply",
+                  iteration,
+                  recall_calls_this_turn,
+              )
+          _final_notice = (
+              "[系统] 你已经连续调用工具 %.0f 分钟没有回答用户，"
+              "请基于现有结果直接回答，不要继续调用工具。"
+              % max(1.0, _silent_tool_budget / 60.0)
+              if _silent_timeout_hit
+              else (
+                  "[系统] 请基于上面的工具结果，"
+                  "直接用一两句话回答用户；不要再调用工具。"
+              )
+          )
+          messages.append({"role": "user", "content": _final_notice})
+          # The forced catch-up keeps the same composed temperature as the
+          # main iterations (tempo base + emotion + density, or the explicit
+          # request value) so the round's voice doesn't shift mid-answer.
+          _catchup_temperature = _round_temperature
+          system, _live_web_pulse = _refresh_round_context()
+          _catchup_kwargs = {
+              "messages": messages,
+              "system": system,
+              "web_state": _live_web_pulse,
+              "tools": None,
+              "max_tokens": 768,
+              "temperature": _catchup_temperature,
+              "top_p": req.top_p,
+          }
+          if provider.name == "local":
+              _catchup_kwargs["top_k"] = req.top_k
+              _catchup_kwargs["repetition_penalty"] = req.repetition_penalty
+          if isinstance(provider, OpenAIProvider):
+              _catchup_kwargs["thinking_override"] = bool(req.thinking)
+              _catchup_kwargs["reasoning_effort_override"] = (
+                  req.reasoning_effort if req.thinking else None
+              )
+          _catchup_text = ""
+          if hasattr(think_filter, "expose"):
+              think_filter.expose = bool(req.thinking)
+          try:
+              async for event in provider.chat(**_catchup_kwargs):
+                  if event["type"] in ("delta", "think") and not first_token_recorded:
+                      first_token_recorded = True
+                      telemetry.observe(
+                          "chat.first_token_seconds", time.perf_counter() - turn_started
+                      )
+                      _emit(
+                          "first_token",
+                          "首 token",
+                          elapsed_ms=(time.perf_counter() - turn_started) * 1000.0,
+                          max_tokens=768,
+                      )
+                  if event["type"] == "delta":
+                      _catchup_text += event["content"]
+                      for ev in think_filter.feed(event["content"]):
+                          if ev.get("event") == "delta":
+                              # Summary JSON is subjective state, not an action
+                              # channel: hide it BEFORE interpreting body/INNER tags.
+                              clean = narration_filter.feed(
+                                  tag_filter.feed(tool_markup_filter.feed(memory_filter.feed(dstate_filter.feed(ev["content"]))))
+                              )
+                              clean = _INLINE_TOOL_MARKER_RE.sub("", clean)
+                              async for action_event in _drain_body_actions():
+                                  yield action_event
+                              if clean and _control_failure_pending and not _control_feedback_sent:
+                                  clean = ""
+                              if clean and _quiet_life_turn:
+                                  # Quiet life round stays silent here too.
+                                  clean = ""
+                              if clean:
+                                  yield _sse({"event": "delta", "content": clean})
+                          else:
+                              yield _sse(ev)
+                  elif event["type"] == "think":
+                      _think_chunk_buf.append(event.get("content", ""))
+                      _flush_think()
+                      yield _sse({"event": "think", "content": event["content"]})
+                  elif event["type"] == "tool_call":
+                      # tools=None: a stray call means the model ignored the
+                      # instruction. Never execute it — that would restart
+                      # the very loop this catch-up exists to end.
+                      log.warning(
+                          "ignoring tool call during forced final answer: %s",
+                          event.get("name", "?"),
+                      )
+                  elif event["type"] == "error":
+                      raise RuntimeError(event.get("message") or "provider error")
+                  elif event["type"] == "end":
+                      _flush_think(force=True)
+                      break
+          except Exception as exc:
+              log.warning("forced final answer failed: %s", exc)
+              _emit("error", "错误", str(exc))
+              yield _sse({"event": "error", "message": str(exc)})
+              _release_active_provider()
+              return
+
+          if _catchup_text.strip():
+              full_text += _catchup_text
+              _vitals_completion_tokens += _estimate_tokens(_catchup_text)
+          if not _visible_reply_text(_catchup_text):
+              if _is_proactive:
+                  # A quiet proactive/continuous round is allowed to end with
+                  # no visible text. DSTATE / next_chat processing still runs.
+                  log.info("proactive round ended silently")
+              else:
+                  log.warning("forced final answer was empty; emitting visible fallback")
+                  yield _sse({"event": "delta", "content": TOOL_LOOP_FALLBACK_TEXT})
+                  full_text += TOOL_LOOP_FALLBACK_TEXT
+          # A silent [INNER:…] produced during the catch-up must not tell the
+          # renderer to hide the bubble that now carries a real answer. On a
+          # quiet life round there is no answer to protect: the inner event is
+          # the only signal that lets the renderer hide the bubble, so keep it.
+          if not _quiet_life_turn:
+              _inner_queue.clear()
+
+      # The tool loop is over: no builtin handler can run for this turn
+      # anymore, so release the provider reference now (also covers the
+      # normal-completion path, not just the error returns above).
+      _release_active_provider()
+
+    # ── 生命体征 finally（点 2/6/7 落账）──────────────────────────────
+    # Runs on EVERY exit of the billed region: normal end, provider error,
+    # client disconnect (GeneratorExit). Every round that REACHED the
+    # provider (user / proactive / silent narration / error / quiet) drains
+    # exactly once and ticks the ledger exactly once — except a round
+    # short-circuited BEFORE the provider (D-quiet, asleep / forced-off /
+    # died proactive): no work = no round. Fast entries belong to the
+    # future reflex layer (drain_small call site), not here.
+    finally:
+        _v = get_vitals()
+        _lg = get_ledger()
+        _tokens = int(_vitals_prompt_tokens)
+        _reached_provider = not _vitals_short_circuited
+        # completion tokens: per-iteration accumulation is folded into
+        # full_text below via the accumulated buffer + final text.
         try:
-            async for event in provider.chat(**_catchup_kwargs):
-                if event["type"] in ("delta", "think") and not first_token_recorded:
-                    first_token_recorded = True
-                    telemetry.observe(
-                        "chat.first_token_seconds", time.perf_counter() - turn_started
-                    )
-                    _emit(
-                        "first_token",
-                        "首 token",
-                        elapsed_ms=(time.perf_counter() - turn_started) * 1000.0,
-                        max_tokens=768,
-                    )
-                if event["type"] == "delta":
-                    _catchup_text += event["content"]
-                    for ev in think_filter.feed(event["content"]):
-                        if ev.get("event") == "delta":
-                            clean = dstate_filter.feed(
-                                narration_filter.feed(tag_filter.feed(ev["content"]))
-                            )
-                            clean = _INLINE_TOOL_MARKER_RE.sub("", clean)
-                            while _walk_queue:
-                                yield _sse(_walk_queue.pop(0))
-                            if clean and _quiet_life_turn:
-                                # Quiet life round stays silent here too.
-                                clean = ""
-                            if clean:
-                                yield _sse({"event": "delta", "content": clean})
-                        else:
-                            yield _sse(ev)
-                elif event["type"] == "think":
-                    _emit(
-                        "think",
-                        "思考",
-                        event.get("content", ""),
-                        provider=provider.name,
-                    )
-                    yield _sse({"event": "think", "content": event["content"]})
-                elif event["type"] == "tool_call":
-                    # tools=None: a stray call means the model ignored the
-                    # instruction. Never execute it — that would restart
-                    # the very loop this catch-up exists to end.
-                    log.warning(
-                        "ignoring tool call during forced final answer: %s",
-                        event.get("name", "?"),
-                    )
-                elif event["type"] == "error":
-                    raise RuntimeError(event.get("message") or "provider error")
-                elif event["type"] == "end":
-                    break
-        except Exception as exc:
-            log.warning("forced final answer failed: %s", exc)
-            _emit("error", "错误", str(exc))
-
-        if _catchup_text.strip():
-            full_text += _catchup_text
-        if not _visible_reply_text(_catchup_text):
-            if _is_proactive:
-                # A quiet proactive/continuous round is allowed to end with
-                # no visible text. DSTATE / next_chat processing still runs.
-                log.info("proactive round ended silently")
-            else:
-                log.warning("forced final answer was empty; emitting visible fallback")
-                yield _sse({"event": "delta", "content": TOOL_LOOP_FALLBACK_TEXT})
-                full_text += TOOL_LOOP_FALLBACK_TEXT
-        # A silent [INNER:…] produced during the catch-up must not tell the
-        # renderer to hide the bubble that now carries a real answer. On a
-        # quiet life round there is no answer to protect: the inner event is
-        # the only signal that lets the renderer hide the bubble, so keep it.
-        if not _quiet_life_turn:
-            _inner_queue.clear()
-
-    # The tool loop is over: no builtin handler can run for this turn
-    # anymore, so release the provider reference now (also covers the
-    # normal-completion path, not just the error returns above).
-    _release_active_provider()
+            _all_text = " ".join(
+                [p for p in (accumulated_full_text or []) if p] + ([full_text] if (full_text or "").strip() else [])
+            )
+            _completion = _estimate_tokens(_all_text)
+        except Exception:
+            _completion = 0
+        _completion = max(_completion, _vitals_completion_tokens)
+        if _reached_provider and _v is not None:
+            try:
+                _v.drain_main(
+                    tokens=_tokens + _completion,
+                    thinking=bool(req.thinking),
+                    temperature=float(_round_temperature),
+                )
+                telemetry.inc("vitals.drain_main.rounds")
+            except Exception as exc:
+                _note_failure("vitals_drain_main", exc)
+        _tick_result = None
+        if _reached_provider and _lg is not None:
+            try:
+                _tick_result = _lg.round_tick()
+            except Exception as exc:
+                _note_failure("ledger_round_tick", exc)
+        if _tick_result is not None:
+            # Publish the NEXT round's pending state (organize mark / overflow
+            # latch); the next round's start reads this slot. A real user
+            # turn never consumed the organize prompt (it must not be
+            # hijacked), so its slot is still pending — the tick's "no mark
+            # this time" must not overwrite it. (A proactive round consumed
+            # and EXECUTED the organize, so its normal publish stands.)
+            try:
+                if (
+                    _user_turn_text is not None
+                    and _pending_organize_kind
+                    and not _tick_result.get("organize_due")
+                ):
+                    _tick_result = dict(_tick_result)
+                    _tick_result["organize_due"] = True
+                    _tick_result["organize_kind"] = _pending_organize_kind
+                _pending_vitals_round["organize_kind"] = (
+                    str(_tick_result.get("organize_kind"))
+                    if _tick_result.get("organize_due") and _tick_result.get("organize_kind")
+                    else None
+                )
+                _pending_vitals_round["overflow"] = bool(_tick_result.get("overflow"))
+            except Exception:
+                pass
+        # Ledger slow entry: every main-brain round records its trimmed
+        # visible reply (quiet rounds use the inner voice / a stub).
+        if _reached_provider and _lg is not None:
+            try:
+                _ledger_text = _visible_reply_text(_all_text)
+                if not _ledger_text.strip():
+                    _inner_text = "\n".join(_round_inner_parts).strip()
+                    _ledger_text = _inner_text or "安静的一轮"
+                _lg.record_slow(_ledger_text.strip()[:2000])
+            except Exception as exc:
+                _note_failure("ledger_record_slow", exc)
+        if _reached_provider:
+            try:
+                telemetry.inc("vitals.rounds_billed")
+            except Exception:
+                pass
 
     # ── DSTATE：更新 D 的滚动总结，并从所有下游文本里剥掉隐藏块 ──
     # The streamed block was already hidden by DStateFilter; the raw text
     # is kept only long enough to update/save the per-theme store, then
     # every visible/persisted copy below uses the cleaned text. The
     # summary itself lives ONLY in the D store (never in memory/history).
+    _d_summary_system = False
     try:
         _d_updated = False
         if _cortex_store is not None:
@@ -6090,6 +8127,24 @@ async def _stream_chat_provider(
                     "cortex: DSTATE applied (summary_chars=%d)",
                     len(_cortex_store.summary),
                 )
+            else:
+                actual_text = _visible_reply_text(" ".join([*accumulated_full_text, full_text]))
+                notes = ["【系统记录：本轮未提供模型主观总结】"]
+                for receipt in reversed(_round_receipts[-8:]):
+                    notes.append(f"执行回执：{receipt['name']}={receipt['status']}；{receipt['summary']}")
+                public_text = "" if _quiet_life_turn else actual_text
+                inner_text = "\n".join(_round_inner_parts)
+                if _quiet_life_turn and actual_text:
+                    inner_text = (inner_text + "\n" + actual_text).strip()
+                if public_text:
+                    notes.append("我实际说过：" + json.dumps(public_text[:300], ensure_ascii=False))
+                if inner_text:
+                    notes.append("我的心声记录：" + json.dumps(inner_text[:300], ensure_ascii=False))
+                if len(notes) > 1:
+                    _cortex_store.update({"summary": "\n".join(notes)})
+                    _cortex_store.save()
+                    _d_updated = True
+                    _d_summary_system = True
         else:
             full_text = _cortex.strip_dstate_blocks(full_text)
     except Exception as exc:
@@ -6102,6 +8157,7 @@ async def _stream_chat_provider(
             "DSTATE 更新",
             _d_state_text,
             updated=bool(_d_updated),
+            source="system" if _d_summary_system else "model",
             chars=len(_d_state_text),
         )
     # Earlier tool rounds must never carry a hidden block downstream either
@@ -6119,8 +8175,9 @@ async def _stream_chat_provider(
     # _on_inner, and _visible_reply_text() strips it, so it is never
     # double-stored here.
     if _quiet_life_turn:
-        _hidden = _visible_reply_text(full_text)
+        _hidden = _visible_reply_text("\n".join([*accumulated_full_text, full_text]))
         if _hidden:
+            _round_inner_parts.append(_hidden)
             try:
                 if _ephemeral_ref is not None:
                     _ephemeral_ref.add_thought(
@@ -6133,6 +8190,33 @@ async def _stream_chat_provider(
             telemetry.inc("decision.quiet.life")
         except Exception:
             pass
+
+    # ── 记忆整理轮落账（点 7）：审查/总结结果写 organize，永不删除 ──
+    # recap 额外 set_recap：正文保存在台账里，下一条真实用户消息附上。
+    # 组织轮的正文 = 用户可见回复（安静轮退回心声）。只在主动轮消费：
+    # 真实用户轮不落 organize 账、不清槽位（未被劫持的轮没有整理产物，
+    # 槽位等下一个主动轮）。
+    if _pending_organize_kind and _user_turn_text is None:
+        _lg7 = get_ledger()
+        if _lg7 is not None:
+            try:
+                _organize_visible = _visible_reply_text(
+                    " ".join([*accumulated_full_text, full_text])
+                ).strip()
+                if not _organize_visible:
+                    _organize_visible = (
+                        "\n".join(_round_inner_parts).strip() or "（这轮没有产出）"
+                    )
+                _lg7.record_organize(_organize_visible)
+                if _pending_organize_kind == "recap":
+                    _lg7.set_recap(_organize_visible)
+                log.info(
+                    "ledger: organize round recorded (kind=%s chars=%d)",
+                    _pending_organize_kind, len(_organize_visible),
+                )
+            except Exception as exc:
+                _note_failure("ledger_record_organize", exc)
+        _pending_organize_kind = None  # cleared after the round completes
 
     # ── Brain stream: did anything visible reach the surface? ─────────
     _brain_parts = list(accumulated_full_text)
@@ -6207,23 +8291,24 @@ async def _stream_chat_provider(
     _tail_from_think = ""
     for ev in think_filter.flush():
         if ev.get("event") == "delta":
-            _tail_from_think += tag_filter.feed(ev["content"]) + tag_filter.flush()
-            while _walk_queue:
-                yield _sse(_walk_queue.pop(0))
+            _tail_from_think += tag_filter.feed(tool_markup_filter.feed(memory_filter.feed(dstate_filter.feed(ev["content"]))))
+            async for action_event in _drain_body_actions():
+                yield action_event
         else:
             yield _sse(ev)
     # 心声 tail: a dangling [INNER:… salvaged at flush (unclosed tag) fires
     # on_inner AFTER the loop above — drain it here so the renderer still
     # learns the turn was silent.
-    tag_filter.flush()
+    _tail_from_think += tag_filter.feed(tool_markup_filter.feed(memory_filter.feed(dstate_filter.flush()) + memory_filter.flush()) + tool_markup_filter.flush()) + tag_filter.flush()
+    async for action_event in _drain_body_actions():
+        yield action_event
     while _inner_queue:
         yield _sse(_inner_queue.pop(0))
     # The narration filter holds the last (newline-less) line of the reply
     # in its buffer — flush it unconditionally, think_filter.flush() may
     # legitimately have nothing left to say.
     _clean_tail = narration_filter.feed(_tail_from_think) + narration_filter.flush()
-    # An unterminated DSTATE tail is dropped here (never shown to the user).
-    _clean_tail = dstate_filter.feed(_clean_tail) + dstate_filter.flush()
+    # The DSTATE tail was already dropped before body-tag interpretation.
     if _clean_tail and not _quiet_life_turn:
         yield _sse({"event": "delta", "content": _clean_tail})
 
@@ -6317,6 +8402,23 @@ async def _stream_chat_provider(
         # temperature. Silent requests (narrator / classifier) never move it.
         if mood_store is not None:
             mood_store.apply_emotion_tag(_emotion)
+    if _continuity_store is not None and not req.silent:
+        try:
+            _continuity_store.record_round(
+                _round_id, _round_started_at, time.time(), _is_proactive,
+                "" if _quiet_life_turn else _brain_visible,
+                "\n".join(_round_inner_parts), list(_round_receipts),
+            )
+            _continuity_store.save()
+        except Exception as exc:
+            _note_failure("continuity_record_round", exc)
+    if not req.silent:
+        _emit(
+            "receipt", "系统 · 本轮事实回执",
+            ("安静" if _quiet_life_turn or not _brain_visible else "已发言")
+            + f"；执行回执 {len(_round_receipts)} 条",
+            receipts=list(_round_receipts),
+        )
     telemetry.observe("chat.turn_seconds", time.perf_counter() - turn_started)
     _emit(
         "round_end",
@@ -6326,6 +8428,14 @@ async def _stream_chat_provider(
         tools=_tool_call_count,
         provider=provider.name,
     )
+    if _reflex_decision is not None:
+        # Escalated reflex round: pace the NEXT tick (renderer honors the
+        # event in its own phase; unknown SSE events are ignored safely
+        # today).
+        yield _sse({
+            "event": "next_check_s",
+            "seconds": int(_reflex_decision.get("next_check_s") or 0),
+        })
     yield _sse({"event": "end"})
 
 

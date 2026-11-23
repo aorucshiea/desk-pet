@@ -177,11 +177,32 @@ def test_ephemeral_dir_snapshot_copies_index(tmp_path):
 
 def test_body_log_first_person():
     log = BodyLog()
-    log.append("walk", "dx=-80, dy=0")
-    log.append("push", "id=3")
+    log.append("walk", "dx=-80, dy=0", source="applied")
+    log.append("push", "id=3", source="applied")
     text = log.format_for_prompt()
     assert "你走动了" in text
     assert "你推开了" in text
+
+
+@pytest.mark.parametrize("source", ["intent", "dice", "decision"])
+def test_body_log_proposals_are_not_completed(source):
+    log = BodyLog()
+    log.append("walk", "dx=80", source=source)
+    text = log.format_for_prompt()
+    assert "你走动了" not in text
+    assert "只是想/请求walk" in text
+    assert "没有执行确认" in text
+
+
+def test_body_log_failure_and_suppression_override_completion():
+    log = BodyLog()
+    log.append("turn", "left", source="failed")
+    log.append("walk", "dx=80", source="applied", suppressed=True)
+    text = log.format_for_prompt()
+    assert "未完成，执行失败" in text
+    assert "但忍住了" in text
+    assert "你走动了" not in text
+    assert "你转头看向" not in text
 
 
 def test_loop_writes_voice_and_calls_reset():

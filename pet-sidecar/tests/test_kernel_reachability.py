@@ -39,8 +39,12 @@ def _live_manager(memory_dir):
 @pytest.fixture()
 def no_container():
     server_mod._plugin_container_ref.clear()
+    # Another test file may have booted the evolve service; without a
+    # container there is no boot either, so its tools must not leak in.
+    server_mod._evolve_service_ref.clear()
     yield
     server_mod._plugin_container_ref.clear()
+    server_mod._evolve_service_ref.clear()
 
 
 class _FakeMcp:
@@ -106,7 +110,7 @@ def test_module_accessors_degrade_without_a_booted_container(no_container):
     # Built-in tools (world + intuition) are intentionally always present;
     # the invariant is that a missing container contributes no *plugin* tools.
     assert defs is not None
-    assert {d.server_name for d in defs} <= {"pet-world", "pet-intuition"}
+    assert {d.server_name for d in defs} <= {"pet-world", "pet-intuition", "pet-tempo", "pet-body"}
     assert all(d.server_name != "pet" for d in defs)
     assert {"pet_world_bodies", "pet_world_operate"} <= {d.name for d in defs}
 

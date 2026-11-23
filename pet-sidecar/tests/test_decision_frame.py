@@ -116,7 +116,9 @@ async def test_one_request_contains_six_legal_questions():
     frame = await decide_frame(text, transport=httpx.MockTransport(handler))
 
     assert frame.source == "laya"
-    assert seen["url"] == "http://127.0.0.1:8765/v1/systemone"
+    from gateway.decision.laya_router import _endpoint_url
+
+    assert seen["url"] == _endpoint_url()
     assert len(bodies) == 1
 
     body = seen["body"]

@@ -38,6 +38,11 @@ _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 # in providers.json can override it with "images" / "capabilities.images".
 _NO_VISION_MODEL_MARKERS = ("gpt-3.5", "text-", "embedding", "davinci", "babbage")
 
+# D's "low" thinking strength is a bounded glance, not unlimited rumination:
+# an autonomous round left uncapped can reason until the token cap collapses
+# into repetition. Only an explicit default/max effort clears the limit.
+LMSTUDIO_LOW_THINKING_BUDGET = 512
+
 
 def is_local_url(base_url: str) -> bool:
     """True when *base_url* points at a loopback endpoint."""
@@ -161,6 +166,9 @@ class OpenAIProvider(BaseProvider):
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 headers=headers,
+                # Use the configured endpoint directly; shell proxy variables
+                # (notably bracketed IPv6 NO_PROXY entries) must not break it.
+                trust_env=False,
                 # read=timeout is per streamed chunk, so a slow local prefill
                 # gets its full budget; connect stays short so a closed LM
                 # Studio fails fast instead of waiting the whole 300 s.
@@ -184,6 +192,8 @@ class OpenAIProvider(BaseProvider):
         top_p: float = 0.95,
         thinking_override: Optional[bool] = None,
         reasoning_effort_override: Optional[str] = None,
+        web_state: Optional[str] = None,
+        tools_enabled: Optional[bool] = None,
         **kwargs,
     ) -> AsyncGenerator[dict, None]:
         """Stream a completion.
@@ -206,6 +216,16 @@ class OpenAIProvider(BaseProvider):
             "max_tokens": max(1, int(max_tokens)),
             "stream": True,
         }
+        # The DeepSeek web bridge reuses one browser session and sends only
+        # deltas after the first turn, so memory that lives in `system`
+        # (flashback/resonance/DSTATE) would never reach later turns. Carry a
+        # compact pulse beside the messages; the bridge injects it into the
+        # next delta. Other OpenAI-compatible APIs must not see this key.
+        if web_state and (self._name == "deepseek-web" or "8766" in self._base_url):
+            body["web_state"] = str(web_state)[:2400]
+            self._log.info("provider web_state chars=%d", len(body["web_state"]))
+        if (self._name == "deepseek-web" or "8766" in self._base_url) and tools_enabled is False:
+            body["tools_enabled"] = False
         # Only set temperature/top_p if explicitly non-default
         if temperature != 0.6:
             body["temperature"] = max(0.0, float(temperature))
@@ -214,20 +234,26 @@ class OpenAIProvider(BaseProvider):
         if openai_tools:
             body["tools"] = openai_tools
             body["tool_choice"] = "auto"
-        # DeepSeek / thinking mode. A per-request override wins over
-        # providers.json. When the effective mode is on, emit
-        # {"type": "enabled"} unless this provider already rejected the
-        # parameter. When it is off, omission is NOT enough: DeepSeek V4
-        # defaults reasoning to on and its docs require an explicit
-        # {"type": "disabled"} — a live canonical-prompt chat with
-        # thinking=False still streamed a long reasoning block (~16 s).
-        # Only send the disabled marker when providers.json explicitly
-        # enabled thinking for a cloud endpoint. Unknown support (None),
-        # already-off config (False), local OpenAI-compatible servers
-        # (LM Studio / llama.cpp reject unknown fields) and providers that
-        # already 400'd on the parameter keep the field absent entirely.
+        # LM Studio's zero generation budget disables reasoning; null clears the limit.
         thinking_mode = self._thinking if thinking_override is None else bool(thinking_override)
-        if not self._thinking_unsupported:
+        effort = (
+            self._reasoning_effort
+            if reasoning_effort_override is None
+            else reasoning_effort_override
+        )
+        is_lmstudio = self._name == "lmstudio"
+        if is_lmstudio:
+            if thinking_mode is False:
+                body["thinking_budget_tokens"] = 0
+            elif thinking_mode is True:
+                body["thinking_budget_tokens"] = (
+                    LMSTUDIO_LOW_THINKING_BUDGET if effort == "low" else None
+                )
+        elif not self._thinking_unsupported:
+            # DeepSeek V4 defaults reasoning on, so a cloud provider configured
+            # with thinking=True needs an explicit disabled marker on override.
+            # Other local endpoints and unknown/already-off configurations keep
+            # the existing omission behaviour.
             if thinking_mode is True:
                 body["thinking"] = {"type": "enabled"}
             elif (
@@ -236,17 +262,11 @@ class OpenAIProvider(BaseProvider):
                 and not self._is_local
             ):
                 body["thinking"] = {"type": "disabled"}
-        # Reasoning effort: passed as top-level field (OpenAI/DeepSeek compat).
-        # The request override wins; when thinking is explicitly off we must
-        # not smuggle the static effort back in (that would re-enable
-        # reasoning on providers that key off reasoning_effort).
-        effort = (
-            self._reasoning_effort
-            if reasoning_effort_override is None
-            else reasoning_effort_override
-        )
+        # OpenAI/DeepSeek effort must not conflict with LM Studio's budget or
+        # smuggle static reasoning back into an explicitly non-thinking round.
         if (
-            effort
+            not is_lmstudio
+            and effort
             and thinking_mode is not False
             and not self._thinking_unsupported
             and effort in ("low", "medium", "high", "xhigh", "max")
@@ -267,7 +287,23 @@ class OpenAIProvider(BaseProvider):
                     if resp.status_code == 400:
                         error_body = (await resp.aread()).decode("utf-8", "ignore")
                         lowered = error_body.lower()
-                        if not retried_without_thinking and "thinking" in lowered and "unsupported" in lowered:
+                        if (
+                            is_lmstudio
+                            and "thinking_budget_tokens" in body
+                            and "thinking_budget_tokens" in lowered
+                        ):
+                            # Dropping a rejected budget would silently re-enable reasoning.
+                            yield error_event(
+                                "LM Studio 不支持当前推理开关 (thinking_budget_tokens); "
+                                f"OpenAI API HTTP 400: {error_body[:500]}"
+                            )
+                            return
+                        if (
+                            not is_lmstudio
+                            and not retried_without_thinking
+                            and "thinking" in lowered
+                            and "unsupported" in lowered
+                        ):
                             self._log.warning(
                                 "Provider %s does not support thinking parameter, retrying without it",
                                 self._name,
@@ -277,7 +313,11 @@ class OpenAIProvider(BaseProvider):
                             retried_without_thinking = True
                             self._thinking_unsupported = True
                             continue
-                        if not retried_without_reasoning and _is_reasoning_content_error(error_body):
+                        if (
+                            not is_lmstudio
+                            and not retried_without_reasoning
+                            and _is_reasoning_content_error(error_body)
+                        ):
                             # DeepSeek thinking mode: the follow-up round lost
                             # reasoning_content. Degrade this provider to
                             # non-thinking and retry exactly once; if it still

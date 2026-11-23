@@ -73,7 +73,14 @@ class ClawdBridge:
         self._session_id = f"pet-{uuid.uuid4().hex[:8]}"
         self._port: Optional[int] = None
         self._cwd = os.getcwd()
-        self._client = httpx.Client(timeout=0.4)
+        # trust_env=False: this client only ever talks to 127.0.0.1 (the
+        # clawd hook server). Inheriting proxy env vars here is at best
+        # useless and at worst fatal — a malformed HTTP(S)_PROXY/ALL_PROXY
+        # value in the user's shell (e.g. a truncated IPv6 literal) makes
+        # httpx raise InvalidURL at Client construction and the whole
+        # gateway crash-loops at startup (2026-11-23 incident: "Invalid
+        # port: ':1]'"). Same policy as decision/reflex.py.
+        self._client = httpx.Client(timeout=0.4, trust_env=False)
         self._token = ""
         self._last_attempt = 0.0
         self._last_success = 0.0

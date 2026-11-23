@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from gateway import persona
 from gateway import server as S
+from gateway.decision import cortex
 from gateway.providers import ProviderRegistry
 
 RENDERER = (
@@ -71,8 +72,25 @@ def test_prompt_has_no_mood_metric_or_self_report():
     assert "你此刻的心情" not in prompt
 
 
+def test_prompts_explain_s_and_name_the_block_d_answers_in():
+    for prompt in (persona.base_prompt_block(), persona.compact_prompt_block()):
+        assert cortex.S_ANSWERS_HEADER in prompt
+        assert "你只出题" in prompt
+        assert "直觉没答" in prompt
+        assert '["左","右"]' in prompt
+
+
 def test_electron_fallback_is_byte_identical_to_the_gateway():
     assert _electron_fallback() == persona.base_prompt_block()
+
+
+def test_prompts_distinguish_intuition_from_observed_facts():
+    for prompt in (persona.base_prompt_block(), persona.compact_prompt_block()):
+        assert "【实时经历（系统事实）】" in prompt
+        assert "旧对话不是新消息" in prompt
+        assert "完成回执" in prompt
+        assert "想象" in prompt
+    assert "能实时看见用户在干什么" not in persona.base_prompt_block()
 
 
 def test_native_variant_only_swaps_the_tool_marker_wording():

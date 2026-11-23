@@ -353,7 +353,8 @@ def test_core_memory_tool_call_keeps_the_stream_alive(make_chat_client):
 
     text = "".join(frame["content"] for frame in frames if frame["event"] == "delta")
     assert "记忆文件夹现在是空的" in text
-    assert "_执行 memory" in text, "the core tool never ran"
+    # The status aside now uses the Chinese display label (memory → 记忆).
+    assert "_执行 记忆" in text, "the core tool never ran"
 
     assert len(provider.calls) == 2, "the tool result did not trigger a follow-up generation"
     follow_up = json.dumps(provider.calls[1]["messages"], ensure_ascii=False, default=str)

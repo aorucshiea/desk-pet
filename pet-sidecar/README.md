@@ -139,6 +139,17 @@ gateway 对 Electron 暴露下列端点（保持旧 bridge 端点兼容，并增
 
 云端 provider 默认开启；**loopback 端点默认关闭**（本地单槽上会和下一条消息抢模型，设置 `PET_EXTRACT_FALLBACK_LOCAL=1` 才开）。新的真实用户回合一进来会取消上一次尚未完成的提取；`PET_EXTRACT_FALLBACK=0` 全局关闭。
 
+### 生命体征与快慢直觉（2026-11-23）
+
+网关自带一套"活着"的会计系统（详见 [`docs/autonomy-architecture.md`](../docs/autonomy-architecture.md) 生命体征章节）：
+
+- **三档节奏**：慢反应 240–360 秒（默认，温度 1.0）/ 快反应 90–150 秒（聊天自动进入，1.2）/ 极快 50–70 秒（活跃对话，1.3）；模型可用 `pet_set_tempo` 自设（TTL 10 分钟回落）。温度 = 档位基准 × 情绪调制 ± 注意密度增量。
+- **电量**：容量 = 2×架构极限上下文；主脑思考轮 `2×tokens×温度`、普通轮 `1×`、快直觉 `0.5×`；剩余 ≤25% 注入低电量提醒、耗尽强制停机（用户消息永不拦截）、充回 30% 恢复。睡眠充电 0.5%/分钟，清醒 0.05%/分钟。
+- **血量**：睡眠中被用户说话吵醒 −1（拖拽/触摸/agent 事件不吵醒）；模型只收到体感话术（头晕/头痛），不知道血条存在；归零 → 记忆入 `_grave-*/` 墓地（插件与配置不动），身体重置。回血接口预留。
+- **500 轮台账**（`ledger.py`）：每 500 轮强制主脑整理（记忆审查 / 阶段回顾交替——回顾注入**最近 100 轮**台账条目，总结挂到下一条用户消息）；快直觉条目周期修剪（≤100 条/周期），慢直觉永久；慢台账 ≥400 触发溢出修剪（每轮 10 条至 200 条）并升级休息提醒。
+- **快直觉 reflex**（`decision/reflex.py`）：小模型对每次主动 tick 做 strict-JSON 判断（prefill `{` + json_schema 配方）——安静轮主脑零调用（`drain_small` 半价 + 台账 fast 条目），`think=true` 才唤醒主脑。配置：`~/.pet/providers.json` 顶层 `"reflex"` 块（baseUrl/model/enabled）或 `PET_REFLEX_URL` / `PET_REFLEX_MODEL` / `PET_REFLEX_ENABLED` 环境变量；默认 LM Studio `127.0.0.1:1234/v1 + lfm3-1.7b`。
+- 状态可观测：`/api/health` 返回 `vitals`（battery_percent/forced_off/should_warn/hp/died/asleep/sleep_stage）与 `ledger`（round_count/counts/pending_recap）对象；渲染端生命周期事件：`tempo`、`next_check_s`、`sleep_state`。
+
 ### DeepSeek 网页版 bridge（可选，实验）
 
 `deepseek_web/` 提供一个零依赖的本地 OpenAI 兼容 bridge（`127.0.0.1:8766`）+ 浏览器扩展：扩展在已登录的 `chat.deepseek.com` 标签页里填输入、发送、等回复，把文本回传给 bridge。桌宠把 bridge 当普通 provider 用，不经过 DeepSeek API。桌宠的 **设置 → 网页模型** 页面可以查看/启动 bridge、测试、一键设为当前模型。

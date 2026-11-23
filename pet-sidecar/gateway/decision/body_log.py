@@ -3,7 +3,7 @@
 设计（2026-10-19）：
 - 记录来源：dice（AI 用决策模型掷骰子）/ intent（LLM 主动 [WALK]）/ decision（元决策点名）
 - 也记录被压抑的念头（suppressed=True）——"我常想动但忍住"是自我认知素材
-- 注入 system prompt：第一人称"你自己刚才做了什么"，让 LLM 认领这些动作（不梦游）
+- 注入 system prompt：区分执行回执与意图，只有 applied 来源是已完成动作
 - 内存环形缓冲（最近 20 条），不进长期记忆（走路这种日常动作不值得占事件库）
 """
 
@@ -47,7 +47,7 @@ class BodyLog:
     def format_for_prompt(self, limit: int = 6) -> str:
         if not self.items:
             return ""
-        lines: List[str] = ["【身体日志】这些是你自己刚才做的事——不是别人，是你："]
+        lines: List[str] = ["【身体日志】执行回执与念头分开；只有身体确认的动作才是已完成："]
         for it in self.items[-limit:]:
             verb = "你" + {
                 "walk": "走动了",
@@ -57,14 +57,19 @@ class BodyLog:
                 "kick": "踢开了",
                 "grab": "拎起了",
                 "look": "转头看向",
+                "turn": "转头看向",
                 "speak": "开口说了",
             }.get(it["action"], f"做了{it['action']}")
             detail = f"（{it['detail']}）" if it["detail"] else ""
             if it["suppressed"]:
                 lines.append(f"- {self._age(it['t'])}：你曾想{detail or '做点什么'}，但忍住了")
+            elif it["source"] == "applied":
+                lines.append(f"- {self._age(it['t'])}：{verb}{detail}（身体已确认）")
+            elif it["source"] == "failed":
+                lines.append(f"- {self._age(it['t'])}：{it['action']}{detail}未完成，执行失败")
             else:
-                lines.append(f"- {self._age(it['t'])}：{verb}{detail}")
-        lines.append("你可以自然地提到它们，就像人记得自己刚才走过神来那样。")
+                lines.append(f"- {self._age(it['t'])}：你只是想/请求{it['action']}{detail}，没有执行确认")
+        lines.append("意图、抽中的动作和主观想象不是执行事实；不要把它们说成已经做了。")
         return "\n".join(lines)
 
     def recent(self, n: int = 5) -> List[Dict[str, Any]]:

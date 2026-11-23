@@ -294,7 +294,8 @@ def build_memory_context(store: EventStore, emotion_index: float = 0.0) -> str:
     if lines:
         # Anchor the model's time sense: every [昨天]/[3天前] label below
         # is relative to this moment.
-        now = datetime.now(timezone.utc)
+        # Local wall-clock: the model reads this as the user's time of day.
+        now = datetime.now()
         now_label = now.strftime("%Y年%m月%d日 %H:%M:%S")
         lines.insert(0, f"（现在是{now_label}。下面的记忆都发生在这一刻之前。）")
         lines.append("")

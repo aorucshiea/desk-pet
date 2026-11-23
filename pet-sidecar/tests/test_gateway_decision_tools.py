@@ -368,3 +368,16 @@ def test_native_dispatch_calls_the_registered_handler():
 
     assert seen == [{"seed": 3}]
     assert result["content"][0]["text"] == "rolled"
+
+
+def test_text_tool_args_tolerate_literal_newlines_in_content():
+    """A memory write with a multi-line body is valid for the model but
+    invalid strict JSON. Losing it made every retry look like
+    ``Unknown action 'None'`` in the web chat."""
+    parsed = parse_mcp_calls(
+        '[MCP:builtin/memory:{"action":"write","path":"记忆/经验/x.md",'
+        '"content":"第一行\n第二行"}]'
+    )
+    assert len(parsed) == 1
+    assert parsed[0]["arguments"]["action"] == "write"
+    assert parsed[0]["arguments"]["content"] == "第一行\n第二行"

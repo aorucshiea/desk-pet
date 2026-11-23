@@ -33,7 +33,7 @@ MODEL_FILES = [
 # Guard against silently keeping a truncated response as a valid checkpoint.
 MIN_SIZES = {
     "model.safetensors": 600_000_000,
-    "tokenizer/tokenizer.json": 30_000_000,
+    "tokenizer/tokenizer.json": 1_000_000,
 }
 MODELSCOPE_BASE = "https://modelscope.cn/models/%s/resolve/master" % MODEL_REPO
 USER_AGENT = "deskpet-laya-sidecar/1.0"

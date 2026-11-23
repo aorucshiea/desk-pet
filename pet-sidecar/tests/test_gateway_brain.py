@@ -9,7 +9,9 @@ that raises must never break the chat stream.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +224,7 @@ def test_round_emits_the_full_brain_sequence(monkeypatch, tmp_path):
         "summary",
         "d_decision",
         "provider",
+        "memory",
         "prompt",
         "tool_call",
         "slow",
@@ -229,6 +232,7 @@ def test_round_emits_the_full_brain_sequence(monkeypatch, tmp_path):
         "first_token",
         "dstate",
         "speak",
+        "receipt",
         "round_end",
     ]
     assert len({event["round"] for event in events}) == 1
@@ -252,30 +256,32 @@ def test_round_emits_the_full_brain_sequence(monkeypatch, tmp_path):
     assert d_decision["meta"]["decision_id"] == "d_test"
     assert d_decision["meta"]["action"] == "speak"
 
-    tool_call = events[5]
-    assert tool_call["title"] == "工具 · pet_enter_slow"
+    tool_call = events[6]
+    # Display label is Chinese; the machine-readable `tool` meta stays raw.
+    assert tool_call["title"] == "工具 · 深思考"
     assert json.loads(tool_call["text"]) == {"strength": "high"}
     assert tool_call["meta"]["tool"] == "pet_enter_slow"
     assert tool_call["meta"]["iteration"] == 1
-    assert events[6]["meta"]["strength"] == "high"
+    assert events[7]["meta"]["strength"] == "high"
 
-    tool_result = events[7]
-    assert tool_result["title"] == "结果 · pet_enter_slow"
+    tool_result = events[8]
+    assert tool_result["title"] == "结果 · 深思考"
     assert tool_result["meta"]["is_error"] is False
     assert tool_result["meta"]["elapsed_ms"] >= 0
     assert tool_result["meta"]["iteration"] == 1
 
-    dstate = events[9]
+    dstate = events[10]
     assert dstate["text"] == "新的总结：用户在场"
     assert dstate["meta"]["updated"] is True
     assert dstate["meta"]["chars"] == len("新的总结：用户在场")
 
-    speak = events[10]
+    speak = events[11]
     assert speak["title"] == "说出来"
     assert "我在呢。" in speak["text"]
     assert speak["meta"]["chars"] >= 3
 
-    round_end = events[11]
+    round_end = events[-1]
+    assert round_end["type"] == "round_end"
     assert round_end["meta"]["iterations"] == 2
     assert round_end["meta"]["tools"] == 1
     assert round_end["meta"]["provider"] == "deepseek"
@@ -291,11 +297,11 @@ def test_round_emits_the_full_brain_sequence(monkeypatch, tmp_path):
     assert store.summary == "新的总结：用户在场"
 
 
-def test_quiet_life_turn_emits_inner_and_quiet_without_speech(monkeypatch, tmp_path):
+def test_think_life_turn_emits_inner_and_quiet_without_speech(monkeypatch, tmp_path):
     _use_store(monkeypatch, tmp_path)
 
     async def _passive(_store, state=None, **_kw):
-        return _decision(action="quiet", action_label="安静")
+        return _decision(action="think", action_label="想")
 
     provider = _RecordingOpenAI(
         [
@@ -330,6 +336,57 @@ def test_quiet_life_turn_emits_inner_and_quiet_without_speech(monkeypatch, tmp_p
     assert dstate["meta"]["updated"] is True
     assert dstate["text"] == "困倦但平静"
     assert events[-1]["type"] == "round_end"
+
+
+def test_think_fragments_are_coalesced_into_readable_brain_events(monkeypatch, tmp_path):
+    _use_store(monkeypatch, tmp_path)
+
+    async def _passive(_store, state=None, **_kw):
+        return _decision()
+
+    fragments = ["用户", "问", "我在", "干什么", "。", "诚实", "回答"]
+    provider = _RecordingOpenAI([[
+        *[{"type": "think", "content": piece} for piece in fragments],
+        {"type": "delta", "content": "我在呢"},
+        {"type": "end"},
+    ]])
+    _install(monkeypatch, provider, passive=_passive)
+
+    frames, events = _run(provider, _req())
+
+    thinks = [event for event in events if event["type"] == "think"]
+    assert len(thinks) == 1
+    assert thinks[0]["text"] == "".join(fragments)
+    assert thinks[0]["meta"]["chars"] == len("".join(fragments))
+    # The live SSE feed keeps every fragment for the chat typewriter.
+    assert [
+        frame["content"] for frame in frames if frame.get("event") == "think"
+    ] == fragments
+    assert "".join(
+        frame.get("content", "") for frame in frames if frame.get("event") == "delta"
+    ) == "我在呢"
+
+
+def test_quiet_life_turn_generates_nothing_at_all(monkeypatch, tmp_path):
+    store = _use_store(monkeypatch, tmp_path)
+
+    async def _passive(_store, state=None, **_kw):
+        return _decision(action="quiet", action_label="安静")
+
+    provider = _RecordingOpenAI([[{"type": "delta", "content": "绝不能生成"}, {"type": "end"}]])
+    _install(monkeypatch, provider, passive=_passive)
+
+    frames, events = _run(provider, _req(messages=_PROACTIVE))
+
+    assert provider.calls == []
+    assert _types(events) == ["round_start", "summary", "d_decision", "quiet", "round_end"]
+    quiet = events[3]
+    assert quiet["title"] == "静 · 不生成念头"
+    assert quiet["meta"]["reason"] == "d_idle"
+    assert quiet["meta"]["generated"] is False
+    assert [f for f in frames if f.get("event") == "delta"] == []
+    assert store.last_round["proactive"] is True
+    assert store.last_round["spoken"] == "" and store.last_round["inner"] == ""
 
 
 def test_tag_only_proactive_round_is_quiet_not_speak(monkeypatch, tmp_path):
@@ -383,3 +440,53 @@ def test_brain_publish_exception_does_not_break_chat(monkeypatch):
     assert visible == "还是能说话。"
     assert frames[0]["event"] == "start"
     assert frames[-1]["event"] == "end"
+
+
+def test_now_anchor_uses_local_wall_clock(monkeypatch, tmp_path):
+    _use_store(monkeypatch, tmp_path)
+
+    async def _passive(_store, state=None, **_kw):
+        return _decision()
+
+    provider = _RecordingOpenAI([[{"type": "delta", "content": "好"}, {"type": "end"}]])
+    _install(monkeypatch, provider, passive=_passive)
+
+    _run(provider, _req())
+
+    system = provider.calls[0]["system"] or ""
+    match = re.search(
+        r"【实时系统事实】现在是(\d{4})年(\d{2})月(\d{2})日 (\d{2}):(\d{2}):(\d{2})。",
+        system,
+    )
+    assert match, system[:300]
+    stamped = datetime.datetime(*map(int, match.groups()))
+    assert abs((datetime.datetime.now() - stamped).total_seconds()) < 120
+
+
+def test_laya_fallback_alert_fires_once_per_failure_streak(monkeypatch, tmp_path):
+    _use_store(monkeypatch, tmp_path)
+    server_mod._D_INTUITION_ALERT["streak"] = 0
+
+    async def _passive(_store, state=None, **_kw):
+        base = _decision(action="quiet")
+        return {**base, "source": "prior", "reason": "laya_timeout|safety_default"}
+
+    provider = _RecordingOpenAI([[{"type": "end"}]])
+    _install(monkeypatch, provider, passive=_passive)
+
+    for _ in range(3):
+        _run(provider, _req(messages=_PROACTIVE))
+
+    alerts = [event for event in brain.snapshot() if event["title"] == "直觉不可用"]
+    assert len(alerts) == 1 and alerts[0]["type"] == "error"
+    assert "Laya" in alerts[0]["text"]
+    assert server_mod._D_INTUITION_ALERT["streak"] == 3
+
+    async def _laya(_store, state=None, **_kw):
+        return {**_decision(), "source": "laya+prior", "reason": "laya"}
+
+    _install(monkeypatch, provider, passive=_laya)
+    _run(provider, _req(messages=_PROACTIVE))
+    assert server_mod._D_INTUITION_ALERT["streak"] == 0
+
+

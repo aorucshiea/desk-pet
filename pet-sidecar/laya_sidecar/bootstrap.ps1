@@ -26,7 +26,6 @@ $VenvDir = Join-Path $Root '.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $Root)
 $ModelFiles = @(
-    'config.json',
     'rl_agent_config.json',
     'model.safetensors',
     'encoder\config.json',
@@ -156,7 +155,7 @@ function Test-ModelDir {
     $weights = Get-Item -LiteralPath (Join-Path $Path 'model.safetensors')
     if ($weights.Length -lt 600000000) { return $false }
     $tokenizer = Get-Item -LiteralPath (Join-Path $Path 'tokenizer\tokenizer.json')
-    if ($tokenizer.Length -lt 30000000) { return $false }
+    if ($tokenizer.Length -lt 1000000) { return $false }
     try {
         $cfg = Get-Content -Raw -LiteralPath (Join-Path $Path 'rl_agent_config.json') | ConvertFrom-Json
         if (-not $cfg.encoder) { return $false }

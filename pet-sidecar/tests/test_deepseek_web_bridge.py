@@ -240,7 +240,47 @@ def test_session_resets_when_page_changes_or_turns_cap():
     assert "SYSTEM" in changed["prompt"]
 
 
-def test_no_tools_ephemeral_turn_does_not_become_session_base():
+def test_system_role_message_never_repeats_inside_a_delta():
+    """The gateway's OpenAIProvider sends system as messages[0]. It changes
+    every turn (memory tree / DSTATE), so it must not poison suffix
+    alignment and pull the whole prompt back into the "delta"."""
+    first = bridge.build_job({
+        "messages": [
+            {"role": "system", "content": "SYS-ONE"},
+            {"role": "user", "content": "第一句"},
+        ],
+    })
+    assert first["new_chat"] is True
+    assert "SYS-ONE" in first["prompt"]
+    _commit(first, "https://chat.deepseek.com/chat/s/abc")
+
+    second = bridge.build_job({
+        "messages": [
+            {"role": "system", "content": "SYS-TWO-CHANGED"},
+            {"role": "user", "content": "第一句"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": "第二句"},
+        ],
+    })
+    assert second["new_chat"] is False
+    assert "SYS-ONE" not in second["prompt"]
+    assert "SYS-TWO-CHANGED" not in second["prompt"]
+    assert "【用户】\n第二句" in second["prompt"]
+    assert len(second["prompt"]) < 200
+
+
+def test_page_updates_are_ignored_while_a_job_is_in_flight(monkeypatch):
+    monkeypatch.setattr(bridge, "PENDING", {"job": {}})
+    bridge._remember_page("https://chat.deepseek.com/chat/s/transient")
+    assert bridge.LAST_PAGE == ""
+    bridge.PENDING.clear()
+    bridge._remember_page("https://chat.deepseek.com/chat/s/settled")
+    assert bridge.LAST_PAGE.endswith("/settled")
+
+
+def test_no_tools_ephemeral_turn_on_an_active_session_is_a_delta():
+    """Boot wake must not reset an established chat: a reset re-sends the
+    whole 【系统设定】 block into the same DeepSeek conversation."""
     normal = bridge.build_job({
         "system": "SYSTEM-WITH-TOOLS",
         "messages": [{"role": "user", "content": "正常"}],
@@ -249,10 +289,30 @@ def test_no_tools_ephemeral_turn_does_not_become_session_base():
 
     boot = bridge.build_job({
         "system": "BOOT-NO-TOOLS",
+        "messages": [
+            {"role": "user", "content": "正常"},
+            {"role": "assistant", "content": "在"},
+            {"role": "user", "content": "醒来"},
+        ],
+        "tools_enabled": False,
+    })
+    assert boot["new_chat"] is False
+    assert "BOOT-NO-TOOLS" not in boot["prompt"]
+    assert "SYSTEM-WITH-TOOLS" not in boot["prompt"]
+    assert "【用户】\n醒来" in boot["prompt"]
+    _commit(boot, "https://chat.deepseek.com/chat/s/abc")
+    assert bridge.SESSION["active"] is True
+    assert bridge.SESSION["turns"] == 2
+
+
+def test_no_tools_ephemeral_without_a_session_resets_after_its_reply():
+    boot = bridge.build_job({
+        "system": "BOOT-NO-TOOLS",
         "messages": [{"role": "user", "content": "醒来"}],
         "tools_enabled": False,
     })
     assert boot["new_chat"] is True
+    assert "BOOT-NO-TOOLS" in boot["prompt"]
     assert boot["_session"]["commit"] is False
     _commit(boot, "https://chat.deepseek.com/chat/s/boot")
     assert bridge.SESSION["active"] is False
@@ -277,7 +337,7 @@ def test_session_reset_endpoint(bridge_server):
 
 def test_chat_completions_queues_image_only_job_once(bridge_server, monkeypatch):
     counter_calls: list[int] = []
-    monkeypatch.setattr(bridge, "_bump_message_counter", lambda: counter_calls.append(1))
+    monkeypatch.setattr(bridge, "_reserve_message", lambda: counter_calls.append(1) or True)
     monkeypatch.setattr(bridge, "LAST_POLL_AT", time.time())
     outcome: dict = {}
 
@@ -390,7 +450,7 @@ def _request(server, method: str, path: str, payload: dict | None = None):
 
 def test_chat_completions_fails_fast_without_extension(bridge_server, monkeypatch):
     counter_calls: list[int] = []
-    monkeypatch.setattr(bridge, "_bump_message_counter", lambda: counter_calls.append(1))
+    monkeypatch.setattr(bridge, "_reserve_message", lambda: counter_calls.append(1) or False)
 
     status, payload = _request(bridge_server, "POST", "/v1/chat/completions", {
         "messages": [{"role": "user", "content": "你好"}],
@@ -432,15 +492,15 @@ def test_daily_limit_env_parses_and_tolerates_garbage(monkeypatch):
     monkeypatch.setenv("PET_WEB_DAILY_LIMIT", "42")
     assert bridge._daily_limit_from_env() == 42
     monkeypatch.setenv("PET_WEB_DAILY_LIMIT", "nope")
-    assert bridge._daily_limit_from_env() == 100
+    assert bridge._daily_limit_from_env() == 30
     monkeypatch.setenv("PET_WEB_DAILY_LIMIT", "0")
     assert bridge._daily_limit_from_env() == 0
 
 
-def test_chat_completions_rejects_when_daily_limit_reached(bridge_server, monkeypatch):
-    counter_calls: list[int] = []
-    monkeypatch.setattr(bridge, "_bump_message_counter", lambda: counter_calls.append(1))
+def test_chat_completions_rejects_when_daily_limit_reached(bridge_server, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(bridge, "LAST_POLL_AT", time.time())
+    monkeypatch.setattr(bridge, "MESSAGES_DAY", time.strftime("%Y-%m-%d"))
     monkeypatch.setattr(bridge, "MESSAGES_TODAY", 7)
     monkeypatch.setattr(bridge, "DAILY_LIMIT", 7)
 
@@ -450,7 +510,6 @@ def test_chat_completions_rejects_when_daily_limit_reached(bridge_server, monkey
 
     assert status == 429
     assert "已达上限" in payload["error"]["message"]
-    assert counter_calls == []
     assert bridge.MESSAGES_TODAY == 7
     assert bridge.PENDING == {}
     assert bridge.JOBS.qsize() == 0
@@ -503,3 +562,28 @@ def test_config_endpoint_rejects_invalid_limits(bridge_server, monkeypatch, tmp_
         assert status == 400
         assert "daily_limit" in payload["error"]["message"]
         assert bridge.DAILY_LIMIT == 100
+
+
+def test_delta_carries_the_gateway_memory_pulse():
+    """Flashback/resonance/DSTATE live in `system`, which a reused web chat
+    never receives. The compact pulse must ride with the newest delta."""
+    first = bridge.build_job({
+        "system": "SYSTEM",
+        "messages": [{"role": "user", "content": "第一句"}],
+    })
+    _commit(first, "https://chat.deepseek.com/chat/s/abc")
+
+    pulse = "【突然浮现在脑海中的事】\n[昨天] 夜里的静\n\n【此刻】还在等天亮"
+    second = bridge.build_job({
+        "messages": [
+            {"role": "user", "content": "第一句"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": "第二句"},
+        ],
+        "web_state": pulse,
+    })
+    assert second["new_chat"] is False
+    assert second["prompt"].startswith("【此刻的记忆】")
+    assert "夜里的静" in second["prompt"]
+    assert "还在等天亮" in second["prompt"]
+    assert "【用户】\n第二句" in second["prompt"]

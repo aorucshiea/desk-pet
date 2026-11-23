@@ -734,7 +734,11 @@ class _FunctionCallProvider:
         yield {"type": "end"}
 
 
-def _run_function_chat(provider, mcp, monkeypatch, tools, clock=None) -> list[bytes]:
+def _run_function_chat(provider, mcp, monkeypatch, tools, clock=None, action=None) -> list[bytes]:
+    async def _confirmed_action(kind, **payload):
+        return {"status": "ok", "applied": True, "kind": kind, **payload}
+
+    monkeypatch.setattr(server_mod, "_pet_action", action or _confirmed_action)
     monkeypatch.setattr(server_mod, "_resolve_provider", lambda *a, **k: provider)
     monkeypatch.setattr(server_mod, "_kernel", lambda: None, raising=False)
     monkeypatch.setattr(server_mod, "get_event_store", lambda: None, raising=False)
@@ -1188,3 +1192,204 @@ def test_reasoning_content_400_gives_up_after_one_retry():
     assert len(transport.bodies) == 2, "must not loop on the same 400"
     errors = [e for e in events if e["type"] == "error"]
     assert len(errors) == 1 and "400" in errors[0]["message"]
+
+
+def test_tool_feedback_prefers_full_content_over_summary():
+    """The web model only got the one-line summary back from `memory list`,
+    so it never saw the file tree and said "里面没列出具体文件"."""
+    from gateway import server as server_mod
+
+    result = {
+        "content": [{
+            "type": "text",
+            "text": '{"success": true, "tree": ["记忆.md", "经验/守到了天亮.md"]}',
+        }],
+        "summary": "当前记忆文件夹内容（相对「记忆/」的路径）。",
+    }
+    feedback = server_mod._tool_feedback_text(result, result["summary"])
+    assert "经验/守到了天亮.md" in feedback
+    assert feedback.startswith('{"success"')
+
+
+def test_tool_feedback_falls_back_to_summary_for_binary_or_oversized_content():
+    from gateway import server as server_mod
+
+    huge = {"content": [{"type": "text", "text": "x" * 7000}]}
+    assert server_mod._tool_feedback_text(huge, "summary") == "summary"
+    image = {"content": [{"type": "text", "text": "data:image/png;base64,AAAA"}]}
+    assert server_mod._tool_feedback_text(image, "summary") == "summary"
+
+
+def test_pet_turn_head_emits_a_turn_event(monkeypatch):
+    provider = _FunctionCallProvider([{
+        "type": "tool_call",
+        "id": "tc_turn",
+        "server_name": "pet-body",
+        "name": "pet_turn_head",
+        "arguments": {"direction": "left"},
+    }])
+    chunks = _run_function_chat(
+        provider,
+        _StubMCP(),
+        monkeypatch,
+        [ToolDef(server_name="pet-body", name="pet_turn_head")],
+    )
+    frames = _frames(chunks)
+    turns = [f for f in frames if f.get("event") == "body_action" and f.get("kind") == "turn"]
+    assert turns and turns[-1]["direction"] == "left"
+    assert turns[-1]["applied"] is True
+    assert frames[-1]["event"] == "end"
+
+
+def test_turn_failure_is_not_reported_as_completed(monkeypatch):
+    provider = _FunctionCallProvider([{
+        "type": "tool_call", "id": "tc_turn_fail", "server_name": "pet-body",
+        "name": "pet_turn_head", "arguments": {"direction": "left"},
+    }])
+    async def _failed_action(_kind, **_payload):
+        return {"status": "error", "applied": False, "message": "not confirmed"}
+
+    _run_function_chat(
+        provider, _StubMCP(), monkeypatch,
+        [ToolDef(server_name="pet-body", name="pet_turn_head")],
+        action=_failed_action,
+    )
+    assert "没有完成" in json.dumps(provider.calls[1]["messages"], ensure_ascii=False)
+
+
+@pytest.mark.parametrize("status, applied, expected", [
+    ("ok", True, "ok"), ("ok", False, "not_applied"), ("error", False, "error"),
+])
+def test_turn_tool_records_actual_receipt_for_followup(monkeypatch, tmp_path, status, applied, expected):
+    from gateway.decision.cortex import DStateStore
+    from gateway.decision.body_log import BodyLog
+    store = DStateStore(tmp_path / "dstate.json")
+    body_log = BodyLog()
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    monkeypatch.setattr(server_mod, "_body_log_ref", body_log)
+    monkeypatch.setenv("PET_CORTEX_ENABLED", "0")
+    calls = []
+
+    async def _act(kind, **payload):
+        calls.append((kind, payload))
+        return {"status": status, "applied": applied, "facing": "left"}
+
+    provider = _FunctionCallProvider([{
+        "type": "tool_call", "id": "tc_actual_turn", "server_name": "pet-body",
+        "name": "pet_turn_head", "arguments": {"direction": "left"},
+    }])
+    chunks = _run_function_chat(
+        provider, _StubMCP(), monkeypatch,
+        [ToolDef(server_name="pet-body", name="pet_turn_head")], action=_act,
+    )
+    assert calls == [("turn", {"direction": "left"})]
+    receipt = DStateStore(store.path).last_round["receipts"][0]
+    assert receipt["name"] == "pet_turn_head"
+    assert receipt["status"] == expected
+    assert receipt["applied"] is applied
+    assert len(body_log.items) == (1 if applied else 0)
+    tool_messages = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"]
+    assert f"执行回执: {expected}" in tool_messages[0]["content"]
+    assert f"pet_turn_head: {expected}" in provider.calls[1]["system"]
+    assert f"pet_turn_head: {expected}" in provider.calls[1]["web_state"]
+    assert _frames(chunks)[-1]["event"] == "end"
+
+
+@pytest.mark.parametrize("body_result, expected", [
+    ({"status": "ok", "applied": True, "x": 210, "y": 120}, "ok"),
+    ({"status": "ok", "applied": False, "message": "clamped"}, "not_applied"),
+    ({"status": "error", "applied": False, "message": "physics unavailable"}, "error"),
+])
+def test_world_walk_legacy_json_preserves_execution_status(monkeypatch, tmp_path, body_result, expected):
+    from gateway.decision.cortex import DStateStore
+    from gateway.decision.body_log import BodyLog
+    store = DStateStore(tmp_path / "dstate.json")
+    body_log = BodyLog()
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    monkeypatch.setattr(server_mod, "_body_log_ref", body_log)
+    monkeypatch.setenv("PET_CORTEX_ENABLED", "0")
+    monkeypatch.setattr(server_mod, "_clawd_headers", lambda: {})
+    requests = []
+
+    def _handle(request):
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/world/bodies":
+            return httpx.Response(200, json={
+                "status": "ok", "pet": {"x": 20, "y": 100, "width": 40, "height": 40},
+                "bodies": [{"id": 7, "label": "window", "rect": {"left": 300, "top": 100,
+                            "right": 600, "bottom": 400}}],
+            })
+        assert request.method == "POST" and request.url.path == "/pet/act"
+        assert json.loads(request.content)["kind"] == "walk"
+        return httpx.Response(200, json=body_result)
+
+    original_client = httpx.AsyncClient
+    def _client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(_handle)
+        return original_client(*args, **kwargs)
+
+    async def _no_world(*_a, **_kw):
+        return []
+
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", _client)
+    monkeypatch.setattr(server_mod, "_world_bodies_for_decision", _no_world)
+    provider = _FunctionCallProvider([{
+        "type": "tool_call", "id": "tc_actual_walk", "server_name": "pet-world",
+        "name": "pet_world_walk_to", "arguments": {"id": 7},
+    }])
+    mcp = _StubMCP()
+    _run_function_chat(provider, mcp, monkeypatch, [ToolDef(server_name="pet-world", name="pet_world_walk_to")])
+    assert len(requests) == 2  # real _world_tool executed GET geometry + POST act
+    assert mcp.called == []
+    receipt = store.last_round["receipts"][0]
+    assert receipt["status"] == expected
+    assert receipt["applied"] is (expected == "ok")
+    assert len(body_log.items) == (1 if expected == "ok" else 0)
+    tool_result = next(m for m in provider.calls[1]["messages"] if m["role"] == "tool")
+    assert f"执行回执: {expected}" in tool_result["content"]
+    expected_flag = '"applied": true' if expected == "ok" else '"applied": false'
+    assert expected_flag in tool_result["content"]
+
+
+def test_world_scout_receipt_is_geometry_not_image(monkeypatch, tmp_path):
+    from gateway.decision.cortex import DStateStore
+    store = DStateStore(tmp_path / "dstate.json")
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    monkeypatch.setenv("PET_CORTEX_ENABLED", "0")
+    world_calls = []
+
+    async def _scout(name, args):
+        world_calls.append((name, args))
+        return "窗口几何：hwnd=7"
+
+    monkeypatch.setattr(server_mod, "_world_tool", _scout)
+    provider = _FunctionCallProvider([{
+        "type": "tool_call", "id": "tc_scout", "server_name": "pet-world",
+        "name": "pet_world_scout", "arguments": {},
+    }])
+    _run_function_chat(provider, _StubMCP(), monkeypatch, [ToolDef(server_name="pet-world", name="pet_world_scout")])
+    assert world_calls == [("pet_world_scout", {})]
+    receipt = store.last_round["receipts"][0]
+    assert receipt["status"] == "ok"
+    assert "不是看见屏幕图像" in receipt["summary"]
+    assert "不是看见屏幕图像" in provider.calls[1]["web_state"]
+
+
+def test_pet_set_tempo_emits_a_tempo_event(monkeypatch):
+    provider = _FunctionCallProvider([{
+        "type": "tool_call",
+        "id": "tc_tempo",
+        "server_name": "pet-tempo",
+        "name": "pet_set_tempo",
+        "arguments": {"mode": "slow"},
+    }])
+    chunks = _run_function_chat(
+        provider,
+        _StubMCP(),
+        monkeypatch,
+        [ToolDef(server_name="pet-tempo", name="pet_set_tempo")],
+    )
+    frames = _frames(chunks)
+    tempo = [f for f in frames if f.get("event") == "tempo"]
+    assert tempo and tempo[-1]["mode"] == "slow"
+    assert frames[-1]["event"] == "end"

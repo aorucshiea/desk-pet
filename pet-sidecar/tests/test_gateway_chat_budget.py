@@ -424,3 +424,17 @@ def test_openai_provider_none_override_keeps_static_defaults():
     body = recorder.bodies[0]
     assert body["thinking"] == {"type": "enabled"}
     assert body["reasoning_effort"] == "max"
+
+
+def test_web_state_is_sent_only_to_the_deepseek_web_bridge():
+    provider, recorder = _provider_with_recorder(
+        base_url="http://127.0.0.1:8766/v1",
+        model="deepseek-web",
+        name="deepseek-web",
+    )
+    _run_provider(provider, web_state="【突然浮现在脑海中的事】夜里的静")
+    assert recorder.bodies[0]["web_state"] == "【突然浮现在脑海中的事】夜里的静"
+
+    normal, normal_recorder = _provider_with_recorder()
+    _run_provider(normal, web_state="PULSE")
+    assert "web_state" not in normal_recorder.bodies[0]

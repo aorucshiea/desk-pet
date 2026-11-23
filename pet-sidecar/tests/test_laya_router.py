@@ -19,6 +19,7 @@ import json
 import httpx
 import pytest
 
+from gateway.decision import laya_router
 from gateway.decision.laya_router import (
     BudgetDecision,
     clear_cache,
@@ -31,7 +32,9 @@ _TIERS = ("fast", "normal", "deep", "max")
 
 
 @pytest.fixture(autouse=True)
-def _clean_router(monkeypatch):
+def _clean_router(monkeypatch, tmp_path):
+    # Never discover the user's managed port during local transport tests.
+    monkeypatch.setattr(laya_router, "_LAYA_RUN_DIR", tmp_path)
     monkeypatch.delenv("PET_LAYA_URL", raising=False)
     monkeypatch.delenv("PET_LAYA_TIMEOUT", raising=False)
     monkeypatch.delenv("PET_LAYA_ENABLED", raising=False)
@@ -469,3 +472,49 @@ def test_simple_question_rules_do_not_use_generic_meta_hint():
     assert decide_by_rules("今天天气怎么样？").tier == "normal"
     assert decide_by_rules("你叫什么名字？").tier == "normal"
     assert decide_by_rules("这段代码为什么报错？").tier == "deep"
+
+
+@pytest.mark.parametrize("port", ["1024", "8775", "65535"])
+def test_managed_port_requires_valid_local_startup_pair(tmp_path, port):
+    (tmp_path / "laya-serve.port").write_text(port + "\n", encoding="ascii")
+    (tmp_path / "laya-serve.pid").write_text("9760\r\n", encoding="ascii")
+    assert laya_router._env_url() == f"http://127.0.0.1:{port}"
+
+
+@pytest.mark.parametrize("port,pid", [
+    (None, "9760"), ("8775", None), ("8775", ""), ("", "9760"),
+    ("1023", "9760"), ("65536", "9760"), ("-8775", "9760"),
+    ("8775.0", "9760"), ("8775\n8765", "9760"), ("８７７５", "9760"),
+    ("8775", "zero"), ("8775", "0"), ("8775", "-1"),
+    ("8775", "1.0"), ("8775", "2147483648"), ("8775", "9760\n20288"),
+])
+def test_invalid_managed_artifacts_fall_back_without_port_guessing(tmp_path, port, pid):
+    if port is not None:
+        (tmp_path / "laya-serve.port").write_text(port, encoding="utf-8")
+    if pid is not None:
+        (tmp_path / "laya-serve.pid").write_text(pid, encoding="utf-8")
+    assert laya_router._env_url() == laya_router.DEFAULT_LAYA_URL
+
+
+def test_explicit_env_wins_over_valid_managed_port(monkeypatch, tmp_path):
+    (tmp_path / "laya-serve.port").write_text("8775", encoding="ascii")
+    (tmp_path / "laya-serve.pid").write_text("9760", encoding="ascii")
+    monkeypatch.setenv("PET_LAYA_URL", " http://laya.test:18765/ ")
+    assert laya_router._endpoint_url() == "http://laya.test:18765/v1/systemone"
+
+
+@pytest.mark.asyncio
+async def test_managed_url_is_used_for_real_request_contract_not_health(tmp_path):
+    (tmp_path / "laya-serve.port").write_text("8775", encoding="ascii")
+    (tmp_path / "laya-serve.pid").write_text("9760", encoding="ascii")
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        # A web harness status response is not a decision answer.
+        return httpx.Response(200, json={"status": "ok"})
+
+    result = await decide_budget("请问今天怎么样", transport=httpx.MockTransport(handler))
+    assert seen == ["http://127.0.0.1:8775/v1/systemone"]
+    assert result.source == "rules"
+    assert "laya_invalid_payload" in result.reason

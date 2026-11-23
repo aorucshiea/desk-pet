@@ -115,81 +115,127 @@ class ThinkBlockFilter:
 # the stream loop can write it to ephemeral memory (瞬忆) instead.
 
 _CTRL_TAG_RE = re.compile(
-    r"\[\s*(?:EMOTION|NEXT_CHAT|WALK_DESKTOP|WALK|INNER)\s*[^\]]*\]",
+    r"\[\s*(?:EMOTION|NEXT_CHAT|WALK_DESKTOP|WALK|TURN|INNER)\s*[^\]]*\]",
     re.IGNORECASE,
 )
 # The longest possible tag prefix we must hold before deciding it is not a
 # tag: "[WALK_DESKTOP" → 13 chars. Holding 16 covers whitespace variants.
 _CTRL_MAX_HOLD = 16
-_CTRL_PREFIXES = ("[EMOTION:", "[NEXT_CHAT:", "[WALK:", "[WALK_DESKTOP", "[INNER:")
+_CTRL_PREFIXES = ("[EMOTION:", "[NEXT_CHAT:", "[WALK:", "[WALK_DESKTOP", "[TURN:", "[INNER:")
 _WALK_RE = re.compile(r"\[\s*WALK\s*:\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", re.IGNORECASE)
+_TURN_RE = re.compile(r"\[\s*TURN\s*:\s*(left|right)\s*\]", re.IGNORECASE)
 _INNER_RE = re.compile(r"\[\s*INNER\s*:\s*([^\]]*)\]", re.IGNORECASE)
 _DANGLING_INNER_RE = re.compile(r"^\s*\[\s*INNER\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 
 class ControlTagFilter:
-    """Stateful stripper for [EMOTION:…] / [NEXT_CHAT:…] / [WALK…] / [INNER…] tokens."""
+    """Scan controls in stream order, keeping nested INNER content opaque."""
+
+    _NAMES = ("EMOTION", "NEXT_CHAT", "WALK", "WALK_DESKTOP", "TURN", "INNER")
+    _DESKTOP_RE = re.compile(r"\[\s*WALK_DESKTOP\s*\]", re.IGNORECASE)
 
     def __init__(
         self,
         on_control: Callable[[str, int | None, int | None], None] | None = None,
         on_inner: Callable[[str], None] | None = None,
     ) -> None:
-        self._buf = ""
         self._on_control = on_control
         self._on_inner = on_inner
+        self._reset()
+
+    def _reset(self) -> None:
+        self._mode = "text"
+        self._parts: list[str] = []
+        self._name = ""
+        self._name_done = False
+        self._depth = 0
 
     def feed(self, piece: str) -> str:
-        """Append a delta; return the safe-to-emit text with tags removed."""
-        self._buf += piece
-        # Surface complete WALK body-commands to the caller BEFORE they are
-        # stripped — the stream loop turns them into body-command SSE events.
-        if self._on_control is not None:
-            for m in _WALK_RE.finditer(self._buf):
-                self._on_control("walk", int(m.group(1)), int(m.group(2)))
-            if re.search(r"\[\s*WALK_DESKTOP\s*\]", self._buf, re.IGNORECASE):
-                self._on_control("walk_desktop", None, None)
-        # 心声: a complete [INNER:…] was captured — hand the content to the
-        # caller (ephemeral-memory write) BEFORE the wholesale strip below
-        # removes the tag (and everything inside it) from display.
-        if self._on_inner is not None:
-            for m in _INNER_RE.finditer(self._buf):
-                self._on_inner(m.group(1).strip())
-        self._buf = _CTRL_TAG_RE.sub("", self._buf)
-        # Hold back a trailing '[' fragment that may yet grow into a tag.
-        # Search the WHOLE buffer (tags up to ~30 chars exceed any fixed
-        # tail window when deltas split mid-tag).
-        idx = self._buf.rfind("[")
-        if idx >= 0:
-            candidate = self._buf[idx:]
-            if "]" not in candidate:
-                squashed = re.sub(r"\s", "", candidate).upper()
-                plausible = candidate == "[" or any(
-                    # candidate still growing toward a tag, or an open tag
-                    # whose closing ']' just hasn't arrived yet
-                    p.startswith(squashed) or squashed.startswith(p)
-                    for p in _CTRL_PREFIXES
-                )
-                if plausible:
-                    emit, self._buf = self._buf[:idx], candidate
-                    return emit
-        out, self._buf = self._buf, ""
-        return out
+        """Consume only new characters; return text known not to be a control."""
+        out: list[str] = []
+        for char in piece:
+            if self._mode == "inner":
+                if char == "[":
+                    self._depth += 1
+                elif char == "]":
+                    self._depth -= 1
+                if self._depth == 0:
+                    self._finish_inner()
+                else:
+                    # Append without copying or rescanning a growing INNER.
+                    self._parts.append(char)
+                continue
+
+            if self._mode == "tag":
+                self._parts.append(char)
+                if char == "]":
+                    self._finish_tag()
+                continue
+
+            if self._mode == "prefix":
+                if char.isspace() and (not self._name or self._name in self._NAMES):
+                    self._parts.append(char)
+                    self._name_done = bool(self._name)
+                    continue
+                if self._name in self._NAMES and char in ":]":
+                    self._parts.append(char)
+                    if char == "]":
+                        self._finish_tag()
+                    elif self._name == "INNER":
+                        self._mode = "inner"
+                        self._depth = 1
+                        self._parts.clear()
+                    else:
+                        self._mode = "tag"
+                    continue
+                name = self._name + char.upper()
+                if not self._name_done and any(tag.startswith(name) for tag in self._NAMES):
+                    self._name = name
+                    self._parts.append(char)
+                    continue
+                # Not a control: release the prefix, then handle this character
+                # normally (it may itself start a new '[' candidate).
+                out.extend(self._parts)
+                self._reset()
+
+            if char == "[":
+                self._mode = "prefix"
+                self._parts.append(char)
+            else:
+                out.append(char)
+        return "".join(out)
+
+    def _finish_tag(self) -> None:
+        tag = "".join(self._parts)
+        name = self._name
+        self._reset()
+        if self._on_control is None:
+            return
+        if name == "WALK":
+            match = _WALK_RE.fullmatch(tag)
+            if match:
+                self._on_control("walk", int(match.group(1)), int(match.group(2)))
+        elif name == "TURN":
+            match = _TURN_RE.fullmatch(tag)
+            if match:
+                self._on_control("turn:" + match.group(1).lower(), None, None)
+        elif name == "WALK_DESKTOP" and self._DESKTOP_RE.fullmatch(tag):
+            self._on_control("walk_desktop", None, None)
+
+    def _finish_inner(self, *, final: bool = False) -> None:
+        content = "".join(self._parts).strip()
+        self._reset()
+        if self._on_inner is not None and (content or not final):
+            self._on_inner(content)
 
     def flush(self) -> str:
-        """Stream end: emit and strip whatever remains."""
-        # 心声 with an unclosed tag (quantized models drop the closing ']'):
-        # salvage the content to on_inner and suppress the raw text — a
-        # dangling "[INNER:…" must never leak into the display stream.
-        m = _DANGLING_INNER_RE.match(self._buf)
-        if m:
-            content = m.group(1).strip().rstrip("]").strip()
-            if content and self._on_inner is not None:
-                self._on_inner(content)
-            self._buf = ""
+        """Salvage unfinished INNER; discard tails with a possible control name."""
+        if self._mode == "inner":
+            self._finish_inner(final=True)
             return ""
-        out = _CTRL_TAG_RE.sub("", self._buf)
-        self._buf = ""
+        # A lone '[' (with optional whitespace) still counts as plain text.
+        out = "".join(self._parts) if self._mode == "prefix" and not self._name else ""
+        self._reset()
         return out
 
 
@@ -201,8 +247,12 @@ class ControlTagFilter:
 # are only decided at a newline, so the filter buffers the tail until it
 # can tell the line is complete.
 
+# The status line's tool name may be the raw id (recall) OR a Chinese
+# display label (记忆 / 调节奏…) — the gateway now shows Chinese labels in
+# its own "_执行 X..._" asides. `\S+?` (non-greedy, no whitespace) covers
+# both without matching whole sentences (those contain spaces).
 _NARRATION_RE = re.compile(
-    r"^\s*_{0,2}\s*执行\s+[A-Za-z_][\w]*\s*(?:\.\.\.)?\s*_{0,2}\s*$"
+    r"^\s*_{0,2}\s*执行\s+\S+?\s*(?:\.\.\.)?\s*_{0,2}\s*$"
 )
 
 
@@ -218,7 +268,9 @@ class DStateFilter:
     START_TAG = "<<<DSTATE>>>"
     END_TAG = "<<<DSTATEEND>>>"
 
-    def __init__(self) -> None:
+    def __init__(self, start_tag: str = START_TAG, end_tag: str = END_TAG) -> None:
+        self.START_TAG = start_tag
+        self.END_TAG = end_tag
         self._buf = ""
         self._inside = False
 
@@ -227,13 +279,13 @@ class DStateFilter:
         out: list[str] = []
         while self._buf:
             if self._inside:
-                idx = self._buf.find(self.END_TAG)
+                idx = self._buf.lower().find(self.END_TAG.lower())
                 if idx < 0:
                     break  # still streaming the hidden JSON
                 self._buf = self._buf[idx + len(self.END_TAG):]
                 self._inside = False
                 continue
-            idx = self._buf.find(self.START_TAG)
+            idx = self._buf.lower().find(self.START_TAG.lower())
             if idx < 0:
                 safe = self._safe_emit_len(self._buf)
                 if safe <= 0:
@@ -256,7 +308,7 @@ class DStateFilter:
         # A held partial start marker at the very end is most likely a
         # truncated block — never leak it. Anything else is plain text.
         out = self._buf
-        if len(out) >= 3 and self.START_TAG.startswith(out):
+        if len(out) >= 3 and self.START_TAG.lower().startswith(out.lower()):
             out = ""
         self._buf = ""
         return out
@@ -264,7 +316,7 @@ class DStateFilter:
     def _safe_emit_len(self, buf: str) -> int:
         max_keep = len(self.START_TAG) - 1
         for keep in range(min(max_keep, len(buf)), 0, -1):
-            if self.START_TAG.startswith(buf[-keep:]):
+            if self.START_TAG.lower().startswith(buf[-keep:].lower()):
                 return len(buf) - keep
         return len(buf)
 

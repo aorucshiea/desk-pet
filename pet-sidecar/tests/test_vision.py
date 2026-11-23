@@ -19,11 +19,12 @@ def test_facing_left_mirrors_the_cone():
     assert visible(100, 0, "left")["in_fov"] is False
 
 
-def test_cone_is_60_degrees_and_400px():
-    # 30° is the edge (tan30 ≈ 0.577); 31° is outside
+def test_cone_is_60_degrees_and_reaches_the_screen_edge():
+    # 30° is the edge (tan30 ≈ 0.577); 31° is outside. Distance no longer
+    # cuts the cone at 400px — it extends to the desktop edge.
     assert visible(100, 57.7, "right")["in_fov"] is True
-    assert visible(400, 0, "right")["in_fov"] is True
-    assert visible(401, 0, "right")["in_fov"] is False
+    assert visible(401, 0, "right")["in_fov"] is True
+    assert visible(100_000, 0, "right")["in_fov"] is True
     assert visible(100, 200, "right")["in_fov"] is False  # ~63°
 
 

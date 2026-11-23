@@ -1,6 +1,6 @@
 """capture_screen defaults to the pet's EXISTING vision cone.
 
-The cone itself lives in gateway.decision.vision (±30°, 400px); the
+The cone itself lives in gateway.decision.vision (±30°, to the screen edge); the
 screenshot helper only mirrors that geometry onto the primary display.
 No new vision system, no scale plumbing: physical scale comes from
 image.width / workArea.width because pet bounds are DIP.
@@ -64,7 +64,7 @@ def test_facing_right_keeps_front_and_blacks_side():
     assert out is not None
     img = _decode(out)
     # Sector bbox only: x 150..550, y 100..500 — far-left/behind is gone.
-    assert img.size == (400, 400)
+    assert img.size == (768, 542)
     assert img.size[0] * img.size[1] < 1000 * 600
     # (400, 250) is ahead: red stays red-ish. Crop offset (150, 100).
     assert _reddish(img.getpixel((250, 150)))
@@ -80,11 +80,11 @@ def test_facing_left_mirrors_the_cone():
 
     assert out is not None
     img = _decode(out)
-    assert img.size == (400, 400)
+    assert img.size == (768, 542)
     # (600, 250) is ahead of a left-facing pet: green stays green-ish.
-    assert _greenish(img.getpixel((150, 150)))
+    assert _greenish(img.getpixel((550, 180)))
     # (840, 110) is behind the pet: black.
-    assert _black(img.getpixel((390, 10)))
+    assert _black(img.getpixel((760, 10)))
 
 
 def test_unusable_geometry_returns_none():
@@ -138,7 +138,7 @@ def test_capture_screen_defaults_to_cone(monkeypatch):
     data = _call_capture(client, {})
 
     assert data["summary"] == "Screenshot captured (vision cone)."
-    assert _decode(data["screenshot_base64"]).size == (400, 400)
+    assert _decode(data["screenshot_base64"]).size == (768, 542)
 
 
 def test_capture_screen_full_skips_cone(monkeypatch):

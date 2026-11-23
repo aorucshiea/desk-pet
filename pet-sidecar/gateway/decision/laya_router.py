@@ -23,7 +23,8 @@ Nothing connects at import time. ``decide_budget`` opens a short-lived
 a transport. Every network wait is bounded and asynchronous.
 
 Environment:
-    PET_LAYA_URL       sidecar base URL (default http://127.0.0.1:8765)
+    PET_LAYA_URL       explicit base URL; otherwise trusted local managed
+                       port/PID files, then http://127.0.0.1:8765
     PET_LAYA_TIMEOUT   HTTP budget in seconds (default 0.4)
     PET_LAYA_ENABLED   "0"/"false"/"no"/"off" disables routing (default on)
 """
@@ -38,6 +39,7 @@ import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -285,10 +287,28 @@ def _emotion_bucket(emotion: float) -> int:
     return -1 if emotion < LOW_MOOD_THRESHOLD else 0
 
 
+# Only start.ps1's trusted local startup artifacts are used for discovery.
+# They are not a health check, and never authorize inspecting/killing a PID.
+_LAYA_RUN_DIR = Path(__file__).resolve().parents[2] / "laya_sidecar" / "run"
+
+
 def _env_url() -> str:
     raw = (os.environ.get(LAYA_URL_ENV) or "").strip()
-    url = (raw or DEFAULT_LAYA_URL).rstrip("/")
-    return url or DEFAULT_LAYA_URL
+    if raw:
+        return raw.rstrip("/") or DEFAULT_LAYA_URL
+    try:
+        port = (_LAYA_RUN_DIR / "laya-serve.port").read_text(encoding="ascii").strip()
+        pid = (_LAYA_RUN_DIR / "laya-serve.pid").read_text(encoding="ascii").strip()
+        if (
+            re.fullmatch(r"[0-9]{1,5}", port)
+            and 1024 <= int(port) <= 65535
+            and re.fullmatch(r"[0-9]{1,10}", pid)
+            and 0 < int(pid) <= 2147483647
+        ):
+            return f"http://127.0.0.1:{int(port)}"
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return DEFAULT_LAYA_URL
 
 
 def _env_timeout() -> float:

@@ -32,7 +32,6 @@ $PortFile = Join-Path $RunDir 'laya-serve.port'
 $OutLog = Join-Path $RunDir 'laya-serve.out.log'
 $ErrLog = Join-Path $RunDir 'laya-serve.err.log'
 $ModelFiles = @(
-    'config.json',
     'rl_agent_config.json',
     'model.safetensors',
     'encoder\config.json',
@@ -135,7 +134,10 @@ function Wait-Health {
         }
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$PortNumber/health" -TimeoutSec 2 -ErrorAction Stop
-            if ($health -and $health.status -eq 'ok') { return $health }
+            # A generic web harness also returns status=ok; require our model.
+            if ($health -and $health.status -eq 'ok' -and @($health.loaded) -ccontains 'zh-tier') {
+                return $health
+            }
         }
         catch {
             # Not listening yet, or still preloading the checkpoint.
@@ -178,7 +180,7 @@ function Test-ModelDir {
         if (-not (Test-Path -LiteralPath (Join-Path $Path $rel) -PathType Leaf)) { return $false }
     }
     if ((Get-Item -LiteralPath (Join-Path $Path 'model.safetensors')).Length -lt 600000000) { return $false }
-    if ((Get-Item -LiteralPath (Join-Path $Path 'tokenizer\tokenizer.json')).Length -lt 30000000) { return $false }
+    if ((Get-Item -LiteralPath (Join-Path $Path 'tokenizer\tokenizer.json')).Length -lt 1000000) { return $false }
     try {
         $cfg = Get-Content -Raw -LiteralPath (Join-Path $Path 'rl_agent_config.json') | ConvertFrom-Json
         if (-not $cfg.encoder) { return $false }
@@ -340,6 +342,8 @@ function Set-SidecarEnvironment {
     $env:LAYA_DEFAULT_MODEL = 'zh-tier'
     $env:LAYA_PRELOAD = '1'
     $env:LAYA_MAX_LOADED = '1'
+    # Reject overlapping inference with 503 instead of building a CPU backlog.
+    $env:LAYA_MAX_CONCURRENT = '1'
     $env:LAYA_IDLE_UNLOAD_SECONDS = '0'
     $env:LAYA_LOG_LEVEL = 'info'
     if ([string]::IsNullOrWhiteSpace($env:LAYA_THREADS)) { $env:LAYA_THREADS = '4' }

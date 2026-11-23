@@ -10,7 +10,7 @@ import math
 from typing import Any, Dict, Optional
 
 FOV_HALF_DEG = 30.0
-FOV_RANGE_PX = 400.0
+FOV_RANGE_PX = 100_000.0  # effectively the work-area edge; angle still limits the cone
 
 
 def facing_vector(facing: Optional[str]) -> tuple[float, float]:

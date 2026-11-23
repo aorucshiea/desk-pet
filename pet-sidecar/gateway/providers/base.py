@@ -131,6 +131,22 @@ def _find_balanced_json(text: str, start: int) -> tuple[str, int, int] | None:
     return None
 
 
+def _loads_tool_args(raw: str) -> dict:
+    """Parse a text-MCP argument object, tolerating raw control characters.
+
+    Models routinely put literal newlines inside ``content`` strings; the
+    strict JSON parser rejects that, the call falls through as ``{}`` and a
+    memory write becomes ``Unknown action 'None'`` — then the model retries
+    and the web chat fills with failed tool results. ``strict=False`` keeps
+    the newline as data instead of losing the whole call.
+    """
+    try:
+        value = json.loads(raw, strict=False)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def parse_mcp_calls(text: str) -> list[dict]:
     """Extract MCP tool calls from model output text.
 
@@ -205,10 +221,7 @@ def parse_mcp_calls(text: str) -> list[dict]:
                             payload = text[colon_pos + 1:close_pos].strip()
                         args = {}
                         if payload.startswith("{"):
-                            try:
-                                args = json.loads(payload)
-                            except json.JSONDecodeError:
-                                args = {}
+                            args = _loads_tool_args(payload)
                         results.append({
                             "server_name": "builtin",
                             "name": name,
@@ -221,10 +234,7 @@ def parse_mcp_calls(text: str) -> list[dict]:
                     idx = colon_pos + 1
                     continue
                 json_str, _, json_end = balanced
-                try:
-                    args = json.loads(json_str)
-                except json.JSONDecodeError:
-                    args = {}
+                args = _loads_tool_args(json_str)
                 server_name = "builtin"
                 name = prefix.strip()
                 if name:
@@ -292,10 +302,7 @@ def parse_mcp_calls(text: str) -> list[dict]:
             server_name = "default"
             name = prefix.strip()
 
-        try:
-            args = json.loads(json_str)
-        except json.JSONDecodeError:
-            args = {}
+        args = _loads_tool_args(json_str)
 
         if isinstance(args, dict):
             results.append({
@@ -311,10 +318,7 @@ def parse_mcp_calls(text: str) -> list[dict]:
         m_start, m_end = match.start(), match.end()
         if any(r[0] <= m_start and m_end <= r[1] for r in used_ranges):
             continue
-        try:
-            args = json.loads(match.group(2))
-        except json.JSONDecodeError:
-            args = {}
+        args = _loads_tool_args(match.group(2))
         results.append({
             "server_name": "default",
             "name": match.group(1),

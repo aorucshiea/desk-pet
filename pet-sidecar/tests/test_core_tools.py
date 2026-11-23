@@ -65,6 +65,8 @@ def test_core_tool_names_are_the_soul_tools_plus_decision_pair():
         "pet_override_decision",
         "pet_enter_slow",
         "pet_decision",
+        "pet_set_tempo",
+        "pet_turn_head",
     }
 
 
@@ -79,10 +81,10 @@ def test_gather_tools_core_only_keeps_soul_tools_and_sheds_heavy_ones(monkeypatc
 
     core = asyncio.run(server_mod._gather_tools(mcp, _req(), core_only=True))
     core_names = [t.name for t in core]
-    assert set(core_names) == {"memory", "recall", "memory_search"}
+    assert set(core_names) == {"memory", "recall", "memory_search", "pet_set_tempo", "pet_turn_head"}
     # Matching is by tool name only — a core tool served by a plugin (pet)
     # or by an MCP server must both survive.
-    assert {t.server_name for t in core} == {"builtin", "pet"}
+    assert {t.server_name for t in core} == {"builtin", "pet", "pet-tempo", "pet-body"}
     assert "desktop_task" not in core_names
     assert "pet_world_bodies" not in core_names
     assert "pet_add_intuition" not in core_names
@@ -228,7 +230,7 @@ def test_core_only_text_mcp_call_reaches_execution(monkeypatch):
         ("builtin", "memory", {"action": "add", "target": "memory", "content": "用户喜欢猫"})
     ], "the core memory call must execute, the heavy desktop_task call must not"
     assert len(provider.calls) >= 2, "the pet must continue after the tool result"
-    assert {t.name for t in provider.calls[0]["tools"]} == {"memory"}
+    assert {t.name for t in provider.calls[0]["tools"]} == {"memory", "pet_set_tempo", "pet_turn_head"}
 
 
 def test_core_only_native_tool_call_reaches_execution(monkeypatch):
@@ -241,7 +243,7 @@ def test_core_only_native_tool_call_reaches_execution(monkeypatch):
         "only the core tool call may execute; the heavy one must be ignored"
     )
     assert len(provider.calls) >= 2
-    assert {t.name for t in provider.calls[0]["tools"]} == {"memory"}
+    assert {t.name for t in provider.calls[0]["tools"]} == {"memory", "pet_set_tempo", "pet_turn_head"}
 
 
 class _BadMarkerProvider:

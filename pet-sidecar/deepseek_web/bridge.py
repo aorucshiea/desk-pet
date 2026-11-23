@@ -43,10 +43,12 @@ MAX_DAILY_LIMIT = 10_000
 
 
 def _daily_limit_from_env() -> int:
+    # 30 is a safety net, not the primary control: the body's letter-writing
+    # rhythm (D tempo + web heartbeat) should naturally stay well under it.
     try:
-        value = int(os.environ.get("PET_WEB_DAILY_LIMIT", "100"))
+        value = int(os.environ.get("PET_WEB_DAILY_LIMIT", "30"))
     except ValueError:
-        return 100
+        return 30
     # 0 / negative = unlimited (useful for local testing).
     return value
 
@@ -106,8 +108,11 @@ SESSION = {
 }
 SESSION_LOCK = threading.Lock()
 LAST_PAGE = ""
-SESSION_MAX_TURNS = int(os.environ.get("PET_WEB_SESSION_MAX_TURNS", "30") or 30)
-SESSION_MAX_CHARS = int(os.environ.get("PET_WEB_SESSION_MAX_CHARS", "120000") or 120000)
+SESSION_MAX_TURNS = int(os.environ.get("PET_WEB_SESSION_MAX_TURNS", "240") or 240)
+SESSION_MAX_CHARS = int(os.environ.get("PET_WEB_SESSION_MAX_CHARS", "480000") or 480000)
+# Last job diagnostics for /health: mode/new_chat/prompt size/page. This is
+# how we tell "delta append" apart from "full system prompt in the chat".
+LAST_JOB: dict = {}
 
 
 JOBS: "queue.Queue[dict]" = queue.Queue()
@@ -193,7 +198,10 @@ def extract_images(body: dict) -> list[dict]:
     return images
 
 
-def flatten_messages(body: dict) -> str:
+FINAL_INSTRUCTION = "请只输出【助手】这一轮要对用户说的话。不要复述设定，不要输出思考过程。"
+
+
+def flatten_messages(body: dict, *, include_instruction: bool = True) -> str:
     system = body.get("system") or ""
     parts: list[str] = []
     if system:
@@ -231,7 +239,8 @@ def flatten_messages(body: dict) -> str:
             parts.append("【工具结果】\n" + content)
         else:
             parts.append("【用户】\n" + content)
-    parts.append("请只输出【助手】这一轮要对用户说的话。不要复述设定，不要输出思考过程。")
+    if include_instruction:
+        parts.append(FINAL_INSTRUCTION)
     return "\n\n".join(parts)[:MAX_PROMPT_CHARS]
 
 
@@ -255,6 +264,22 @@ def _overlap(old: list[str], new: list[str]) -> int:
     return 0
 
 
+def _remember_page(page: str) -> None:
+    """Track the page URL only while no job is in flight.
+
+    DeepSeek rewrites the conversation URL while the first reply is being
+    generated. A poll during that window used to move LAST_PAGE, so the next
+    job saw page_changed and re-sent the full system prompt into a new chat.
+    """
+    global LAST_PAGE
+    if not page:
+        return
+    with LOCK:
+        busy = bool(PENDING) or not JOBS.empty()
+    if not busy:
+        LAST_PAGE = page
+
+
 def _reset_session() -> None:
     with SESSION_LOCK:
         SESSION.update({
@@ -274,8 +299,7 @@ def _commit_session(candidate: dict | None, page: str = "") -> None:
         # Boot wake / compression requests intentionally run without tools.
         # They must not become the session base, or later deltas would never
         # receive the tool-bearing hard prompt.
-        _reset_session()
-        return
+        return  # An ephemeral boot must not destroy the existing session base.
     with SESSION_LOCK:
         SESSION.update({
             "active": True,
@@ -293,7 +317,39 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
     later turns the DeepSeek page already has the transcript, so only new
     user/tool messages are sent; assistant messages are already in the page.
     """
-    messages = body.get("messages") or []
+    raw_messages = body.get("messages") or []
+    # OpenAI-compatible callers (the gateway's OpenAIProvider) put the system
+    # prompt inside messages as role=system. It changes on almost every turn
+    # (memory tree / DSTATE / now anchor), so treating it as part of the
+    # transcript makes suffix alignment restart at 0 and re-sends the whole
+    # 8k prompt under the label "delta". Split it out: system belongs to the
+    # session base, never to a delta.
+    system_text = str(body.get("system") or "").strip()
+    visible: list[dict] = []
+    system_parts: list[str] = [system_text] if system_text else []
+    for message in raw_messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") == "system":
+            content = message.get("content")
+            if isinstance(content, list):
+                text = " ".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("text")
+                )
+            else:
+                text = str(content or "")
+            if text.strip():
+                system_parts.append(text.strip())
+        else:
+            visible.append(message)
+    system_text = "\n\n".join(system_parts).strip()
+    # A compact pulse built by the gateway (flashback / resonance / DSTATE).
+    # It is not part of the system base: it changes every turn and must ride
+    # beside the newest user delta, otherwise a reused web chat never sees it.
+    web_state = str(body.get("web_state") or "").strip()[:2400]
+    messages = visible
     fingerprints = [
         _message_fingerprint(m) for m in messages if isinstance(m, dict)
     ]
@@ -311,7 +367,7 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
             SESSION["turns"] >= SESSION_MAX_TURNS
             or SESSION["chars"] >= SESSION_MAX_CHARS
         )
-        full = ephemeral or (not SESSION["active"]) or page_changed or capped
+        full = (not SESSION["active"]) or page_changed or capped
         if not full:
             if len(fingerprints) > 1 and len(set(fingerprints)) == 1 and old_fingerprints:
                 # Proactive life rounds all carry the same text ("生命在继续")
@@ -328,7 +384,11 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
                 if isinstance(m, dict) and str(m.get("role") or "user") != "assistant"
             ]
             if delta:
-                prompt = flatten_messages({"messages": delta})
+                prompt = flatten_messages(
+                    {"messages": delta}, include_instruction=False
+                )
+                if web_state:
+                    prompt = "【此刻的记忆】\n" + web_state + "\n\n" + prompt
                 images = extract_images({"messages": delta})
                 candidate = {
                     "fingerprints": fingerprints,
@@ -336,6 +396,8 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
                     "turns": SESSION["turns"] + 1,
                     "chars": SESSION["chars"] + len(prompt),
                     "mode": "delta",
+                    "system_chars": len(system_text),
+                    "visible_messages": len(messages),
                     "commit": True,
                 }
                 return prompt, images, False, candidate
@@ -351,7 +413,11 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
             last = messages[-1] if messages else None
             if isinstance(last, dict) and str(last.get("role") or "user") != "assistant":
                 delta = [last]
-                prompt = flatten_messages({"messages": delta})
+                prompt = flatten_messages(
+                    {"messages": delta}, include_instruction=False
+                )
+                if web_state:
+                    prompt = "【此刻的记忆】\n" + web_state + "\n\n" + prompt
                 images = extract_images({"messages": delta})
                 if prompt.strip() or images:
                     candidate = {
@@ -360,6 +426,8 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
                         "turns": SESSION["turns"] + 1,
                         "chars": SESSION["chars"] + len(prompt),
                         "mode": "delta-repeat",
+                        "system_chars": len(system_text),
+                        "visible_messages": len(messages),
                         "commit": True,
                     }
                     return prompt, images, False, candidate
@@ -370,13 +438,18 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
         # proactive prompt (the gateway keeps the last 8 life ticks), send a
         # single copy: the page needs the current turn, not eight identical
         # instruction blocks that bloat the context and confuse the model.
-        full_body = body
+        full_system = (
+            (system_text + "\n\n" + FINAL_INSTRUCTION).strip()
+            if system_text
+            else FINAL_INSTRUCTION
+        )
+        full_body = {"system": full_system, "messages": messages}
         if len(fingerprints) > 1 and len(set(fingerprints)) == 1:
             full_body = {
-                "system": body.get("system"),
+                "system": full_system,
                 "messages": [messages[-1]],
             }
-        prompt = flatten_messages(full_body)
+        prompt = flatten_messages(full_body, include_instruction=False)
         images = extract_images(full_body)
         candidate = {
             "fingerprints": fingerprints,
@@ -384,6 +457,8 @@ def _plan_session(body: dict, page: str) -> tuple[str, list[dict], bool, dict]:
             "turns": 1,
             "chars": len(prompt),
             "mode": "full",
+            "system_chars": len(system_text),
+            "visible_messages": len(messages),
             "commit": not ephemeral,
         }
         return prompt, images, True, candidate
@@ -401,6 +476,33 @@ def build_job(body: dict) -> dict | None:
     prompt, images, new_chat, candidate = _plan_session(body, LAST_PAGE)
     if not prompt.strip() and not images:
         return None
+    try:
+        LAST_JOB.clear()
+        LAST_JOB.update({
+            "ts": int(time.time()),
+            "mode": candidate.get("mode"),
+            "new_chat": bool(new_chat),
+            "prompt_chars": len(prompt),
+            "system_chars": int(candidate.get("system_chars") or 0),
+            "web_state_chars": len(str(body.get("web_state") or "")),
+            "messages": int(candidate.get("visible_messages") or 0),
+            "session_active_before": bool(SESSION["active"]),
+            "turns_before": int(SESSION["turns"]),
+            "page": candidate.get("page") or LAST_PAGE,
+        })
+        print(
+            "[bridge] job mode=%s new_chat=%s prompt=%d system=%d page=%s"
+            % (
+                LAST_JOB["mode"],
+                LAST_JOB["new_chat"],
+                LAST_JOB["prompt_chars"],
+                LAST_JOB["system_chars"],
+                LAST_JOB["page"],
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:16],
         "prompt": prompt,
@@ -415,20 +517,26 @@ def _chunk(text: str):
         yield text[index:index + 18]
 
 
-def _bump_message_counter() -> None:
+def _reserve_message() -> bool:
+    """Roll the day before checking the cap, and reserve exactly one accepted job."""
     global MESSAGES_TODAY, MESSAGES_DAY
     day = time.strftime("%Y-%m-%d")
-    if day != MESSAGES_DAY:
-        MESSAGES_DAY = day
-        MESSAGES_TODAY = 0
-    MESSAGES_TODAY += 1
+    with LOCK:
+        if day != MESSAGES_DAY:
+            MESSAGES_DAY = day
+            MESSAGES_TODAY = 0
+        if DAILY_LIMIT > 0 and MESSAGES_TODAY >= DAILY_LIMIT:
+            return False
+        MESSAGES_TODAY += 1
+        count = MESSAGES_TODAY
     try:
         target = os.path.join(os.path.expanduser("~"), ".pet")
         os.makedirs(target, exist_ok=True)
         with open(os.path.join(target, "deepseek-web-usage.json"), "w", encoding="utf-8") as handle:
-            json.dump({"day": day, "count": MESSAGES_TODAY}, handle)
+            json.dump({"day": day, "count": count}, handle)
     except OSError:
         pass
+    return True
 
 
 def _load_message_counter() -> None:
@@ -472,12 +580,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------
     def do_GET(self):
-        global LAST_POLL_AT, LAST_PAGE
+        global LAST_POLL_AT
         parsed = urlparse(self.path)
         path = parsed.path
         page = (parse_qs(parsed.query).get("page") or [""])[0]
         if path == "/jobs/next" and page:
-            LAST_PAGE = page
+            _remember_page(page)
         if path == "/health":
             now = time.time()
             last = LAST_POLL_AT
@@ -497,6 +605,7 @@ class Handler(BaseHTTPRequestHandler):
                 "session_turns": SESSION["turns"],
                 "session_page": SESSION["page"],
                 "last_page": LAST_PAGE,
+                "last_job": dict(LAST_JOB),
                 "model": "deepseek-web",
             })
         if path == "/v1/models":
@@ -591,7 +700,7 @@ class Handler(BaseHTTPRequestHandler):
             reject = _reject_if_no_extension()
             if reject:
                 return self._json(503, {"error": {"message": reject}})
-            if DAILY_LIMIT > 0 and MESSAGES_TODAY >= DAILY_LIMIT:
+            if not _reserve_message():
                 return self._json(429, {
                     "error": {
                         "message": (
@@ -610,7 +719,6 @@ class Handler(BaseHTTPRequestHandler):
             }
             with LOCK:
                 PENDING[job_id] = pending
-            _bump_message_counter()
             JOBS.put(job)
             # Keep the long timeout for a mid-job disconnect: while the
             # extension is busy processing we cannot tell "busy" from "gone",
