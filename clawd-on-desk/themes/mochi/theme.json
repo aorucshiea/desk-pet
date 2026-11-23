@@ -19,7 +19,31 @@
   },
   "states": {
     "idle": [
-      "mochi-idle.gif"
+      "mochi-idle.gif",
+      {
+        "file": "mochi-idle-happy.gif",
+        "emotion": "happy"
+      },
+      {
+        "file": "mochi-idle-sad.gif",
+        "emotion": "sad"
+      },
+      {
+        "file": "mochi-idle-curious.gif",
+        "emotion": "curious"
+      },
+      {
+        "file": "mochi-idle-angry.gif",
+        "emotion": "angry"
+      },
+      {
+        "file": "mochi-idle-love.gif",
+        "emotion": "love"
+      },
+      {
+        "file": "mochi-idle-tired.gif",
+        "emotion": "tired"
+      }
     ],
     "thinking": [
       "mochi-thinking.gif"

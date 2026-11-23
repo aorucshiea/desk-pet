@@ -259,6 +259,95 @@ def st_idle() -> None:
     save_gif("idle", frames, 160)
 
 
+# ── 情绪变体（states.idle 的 {file, emotion} 扩展）────────────────────
+def st_idle_happy() -> None:
+    """开心：弯眼笑 + 脸颊红 + 小爱心飘起。"""
+    n = 8
+    frames = []
+    for p in range(n):
+        f = _base(p, n, tail=1)
+        f.legs(CX, BY)
+        f.face(CX, BY, eyes="happy", mouth="open", blush=True)
+        if p % 2 == 0:
+            f.heart(CX + 14, 10 - p // 2)
+        frames.append(f)
+    save_gif("idle-happy", frames, 140)
+
+
+def st_idle_sad() -> None:
+    """难过：垂耳 + 泪滴 + 嘴角下撇。"""
+    n = 8
+    frames = []
+    for p in range(n):
+        f = _base(p, n, ear_l="flat", ear_r="flat", tail=-1)
+        f.legs(CX, BY)
+        f.face(CX, BY, eyes="sad", mouth="wavy", blush=False)
+        if p % 2 == 0:
+            f.drop(CX - 8, BY - 4)
+        frames.append(f)
+    save_gif("idle-sad", frames, 160)
+
+
+def st_idle_curious() -> None:
+    """好奇：歪头 + 问号 + 眼睛睁大。"""
+    n = 8
+    frames = []
+    for p in range(n):
+        f = _base(p, n, squash_cycle=False)
+        f.legs(CX, BY)
+        f.face(CX, BY, eyes="open", mouth="none", dy=-1)
+        bob = f.bounce_offset(p, n, 1)
+        f.qmark(CX + 12, 8 + bob)
+        frames.append(f)
+    save_gif("idle-curious", frames, 150)
+
+
+def st_idle_angry() -> None:
+    """生气：X 眼 + 叹号 + 红脸。"""
+    n = 6
+    frames = []
+    for p in range(n):
+        shake = 1 if p % 2 == 0 else -1
+        f = Frame()
+        f.body(CX + shake, BY, ear_l="flat", ear_r="flat", tail=0)
+        f.legs(CX + shake, BY)
+        f.face(CX + shake, BY, eyes="x", mouth="wavy", blush=True)
+        f.bang(CX + shake, 6, RED)
+        frames.append(f)
+    save_gif("idle-angry", frames, 120)
+
+
+def st_idle_love() -> None:
+    """爱意：弯眼 + 双爱心环绕。"""
+    n = 8
+    frames = []
+    for p in range(n):
+        f = _base(p, n, tail=1)
+        f.legs(CX, BY)
+        f.face(CX, BY, eyes="happy", mouth="open", blush=True)
+        ang = 2 * math.pi * p / n
+        hx = CX + 14 * math.cos(ang)
+        hy = 12 + 4 * math.sin(ang)
+        f.heart(round(hx), round(hy))
+        f.heart(round(CX - 14 * math.cos(ang)), round(12 - 4 * math.sin(ang)))
+        frames.append(f)
+    save_gif("idle-love", frames, 130)
+
+
+def st_idle_tired() -> None:
+    """疲惫：闭眼 + 小 Zzz。"""
+    n = 8
+    frames = []
+    for p in range(n):
+        f = _base(p, n, ear_l="flat", tail=0)
+        f.legs(CX, BY)
+        f.face(CX, BY, eyes="closed", mouth="none")
+        if p % 2 == 0:
+            f.bubble_zzz(CX + 12, 8, p // 2)
+        frames.append(f)
+    save_gif("idle-tired", frames, 200)
+
+
 def st_thinking() -> None:
     n = 8
     frames = []
@@ -651,6 +740,13 @@ def st_waking() -> None:
 
 if __name__ == "__main__":
     st_idle()
+    # 情绪变体（states.idle 的 {file, emotion} 扩展）
+    st_idle_happy()
+    st_idle_sad()
+    st_idle_curious()
+    st_idle_angry()
+    st_idle_love()
+    st_idle_tired()
     st_thinking()
     st_working()
     st_juggling()
