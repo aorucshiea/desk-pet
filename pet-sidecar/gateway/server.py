@@ -637,6 +637,9 @@ def _vitals_state_dir():
 # slow-overflow latch. Keys absent/false ⇒ the next round is a normal one.
 _pending_vitals_round: dict = {"organize_kind": None, "overflow": False}
 
+# B-17 双睡眠统一：上次推送给壳的 vitals 睡眠态（None=未知，True=睡着，False=清醒）
+_last_vitals_sleep: Optional[bool] = None
+
 # 记忆整理轮（点 7）：audit 只保留核心记忆工具；recap 一个工具都不给。
 _ORGANIZE_AUDIT_TOOLS = {"memory", "recall", "memory_search"}
 _ORGANIZE_PROMPTS = {
@@ -1682,13 +1685,29 @@ def build_app(
                     _vitals_now = get_vitals()
                     if _vitals_now is not None:
                         try:
-                            if _vitals_now.is_asleep():
+                            # B-17 双睡眠统一：vitals 睡眠状态驱动壳动画。
+                            # 跟踪上次推送的睡眠态，只在状态翻转时发 bridge.post，
+                            # 避免每分钟重复刷 sleeping 状态（state.js 的 sleeping
+                            # 动画是持续播放的，不需要重复触发）。
+                            _asleep_now = _vitals_now.is_asleep()
+                            if _asleep_now != _last_vitals_sleep:
+                                if _asleep_now:
+                                    bridge.post("sleeping")
+                                    log.info("vitals: 进入睡眠，推送 sleeping 动画")
+                                else:
+                                    bridge.post("idle")
+                                    log.info("vitals: 醒来，推送 idle 动画")
+                                _last_vitals_sleep = _asleep_now
+
+                            if _asleep_now:
                                 _vitals_now.charge(1.0, asleep=True)
                                 if _vitals_now.natural_wake():
                                     log.info(
                                         "vitals: 自然醒（睡眠计时结束），电量 %d%%",
                                         round(_vitals_now.percent()),
                                     )
+                                    # natural_wake 已把 _sleep 置 None，下一轮
+                                    # _asleep_now=False 会触发 idle 推送。
                             else:
                                 _vitals_now.charge(1.0, asleep=False)
                         except Exception as exc:
