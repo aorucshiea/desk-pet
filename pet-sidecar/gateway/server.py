@@ -701,6 +701,24 @@ def _vitals_health() -> dict:
     if v is None:
         return None
     try:
+        # 当前节奏（ tempo store 可能过期，过期则为 derive 的 slow）
+        tempo_mode = None
+        try:
+            tempo_mode, _tempo_source = _resolve_tempo(time.time())
+        except Exception:
+            tempo_mode = None
+
+        # 睡眠剩余秒数与是否强制
+        sleep_remaining_s = None
+        sleep_forced = None
+        try:
+            if v.is_asleep():
+                sleep_remaining_s = max(0, int(v.sleep_remaining_s()))
+                sleep = v.sleep
+                sleep_forced = bool(sleep and sleep.get("decided_by") == "forced")
+        except Exception:
+            pass
+
         return {
             "battery_percent": round(float(v.percent()), 1),
             "forced_off": bool(v.forced_off),
@@ -709,6 +727,9 @@ def _vitals_health() -> dict:
             "died": bool(v.died),
             "asleep": bool(v.is_asleep()),
             "sleep_stage": v.sleep_stage,
+            "tempo_mode": tempo_mode,
+            "sleep_remaining_s": sleep_remaining_s,
+            "sleep_forced": sleep_forced,
         }
     except Exception as exc:
         get_logger().warning("vitals health read failed: %s", exc)
