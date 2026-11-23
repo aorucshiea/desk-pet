@@ -515,8 +515,9 @@ def test_user_prompt_is_compact_chinese_lines_not_json():
     assert "最近心声：好安静；有点困" in prompt
     assert "{" not in prompt and "}" not in prompt
     assert json.dumps(_NIGHT_STATE, ensure_ascii=False) not in prompt
+    assert "当前时间：（未知）" in prompt
     lines = [line for line in prompt.split("\n") if line]
-    assert len(lines) == 7
+    assert len(lines) == 8
 
 
 def test_user_prompt_defaults_fill_missing_state():
