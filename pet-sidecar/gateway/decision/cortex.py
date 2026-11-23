@@ -83,7 +83,22 @@ _QUESTION_SPECS = {
     "thinking": "凭底层直觉选择这一轮的思考强度。",
     "reaction": "凭底层直觉选择这一轮持续反应的篇幅。",
     "action": "凭底层直觉选择接下来最自然的默认动作。",
+    # 时间感是 D 的固定问题，不是系统塞给它的上下文。4–6 由直觉自己作答
+    # （choice 三问走采样，这三问走自由文本），答案一起进面板与主脑 prompt。
+    "time_doing": "你之前或者刚刚在做什么？（凭直觉回忆，一行短句）",
+    "time_relevant": "你需要知道现在的时间吗？（跟时间有关的事才需要）",
+    "time_note": "你之前或者刚刚做的事情已经过去了多久？（凭台账估计，不知道就空）",
 }
+
+# D 的固定问题全集：1–3 决定这一拍怎么过，4–6 决定它有没有时间感。
+FIXED_QUESTION_ORDER: Tuple[str, ...] = (
+    "thinking",
+    "reaction",
+    "action",
+    "time_doing",
+    "time_relevant",
+    "time_note",
+)
 
 
 def _copy_options(options: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -981,6 +996,9 @@ async def _decision(
         "confidence": sum(chosen_posteriors) / len(chosen_posteriors),
         "source": source,
         "questions": question_results,
+        # 固定问题 4–6 的答案：Laya 只能做选择题，时间感由直觉小模型
+        # （reflex）在覆盖阶段填进来；Laya 缺席时保持"不知道"。
+        "time": {"doing": "", "relevant": False, "note": ""},
         "s_answers": s_answers,
         "summary_used": bool(summary.strip()),
         "reason": (
@@ -1059,6 +1077,22 @@ def decision_to_prompt(decision: dict) -> str:
         f"持续反应：{reaction_label}（max_tokens={max_tokens}）\n"
         f"默认动作：{action_label}（只是默认，可以改；用户直接说话必须回应）"
     )
+    # 固定问题 4–6（时间感）：直觉自己回答的，不是系统塞进来的上下文。
+    # 全部空着就不占 prompt 字数——没时间感的时候多一行是噪音。
+    time_info = decision.get("time") or {}
+    if isinstance(time_info, dict):
+        doing = str(time_info.get("doing") or "").strip()
+        note = str(time_info.get("note") or "").strip()
+        relevant = bool(time_info.get("relevant"))
+        if doing:
+            text += f"\n刚才我在做什么：{doing}"
+        if relevant or note:
+            parts = []
+            if relevant:
+                parts.append("需要知道现在的时间")
+            if note:
+                parts.append(f"已经过去了 {note}")
+            text += "\n时间感：" + "；".join(parts)
     if decision.get("action") == "think":
         text += (
             "\n这一轮是心声模式：不要输出给用户看的可见正文。"
@@ -1092,6 +1126,7 @@ __all__ = [
     "DEFAULT_ACTION_OPTIONS",
     "DEFAULT_STRENGTH_OPTIONS",
     "DEFAULT_REACTION_OPTIONS",
+    "FIXED_QUESTION_ORDER",
     "REACTION_MAX_TOKENS",
     "strip_dstate_blocks",
     "parse_dstate_block",

@@ -6647,6 +6647,10 @@ async def _stream_chat_provider(
                     _d_latency_ms if _d_latency_ms is not None
                     else _cortex_latency_ms
                 ),
+                # 固定问题 4–6（时间感）的直觉答案，让面板能显示"它记得自己在做什么"
+                time_doing=(_decision.get("time") or {}).get("doing") or "",
+                time_relevant=bool((_decision.get("time") or {}).get("relevant")),
+                time_note=(_decision.get("time") or {}).get("note") or "",
                 summary_chars=len(_d_summary),
                 decision_id=_decision.get("decision_id"),
             )
@@ -6777,6 +6781,13 @@ async def _stream_chat_provider(
         _REFLEX_TIME_STATE["asked_at"] = (
             time.time() if _REFLEX_TIME_STATE["wanted"] else 0.0
         )
+        # 固定问题 4–6 的答案回填进 D 决策：时间感是 D 的固定问题之一，
+        # 面板和主脑 prompt 都要看到直觉自己给出的三问答案。
+        _decision["time"] = {
+            "doing": str(_reflex_decision.get("time_doing") or "").strip(),
+            "relevant": bool(_reflex_decision.get("time_relevant")),
+            "note": str(_reflex_decision.get("time_note") or "").strip(),
+        }
         # ── reflex 决策覆盖 D 先验采样（安静轮 + 升级轮都要）─────────────
         # 用户裁定：D 的思考强度/持续反应/默认动作由直觉小模型决定，D 的
         # 先验采样只作参考。覆盖必须发生在发布/注入/req 赋值之前——旧代码
@@ -6840,13 +6851,15 @@ async def _stream_chat_provider(
             )
         log.info(
             "reflex decision override: thinking=%s reaction=%s action=%s "
-            "max_tokens=%d reason=%s time_wanted=%s",
+            "max_tokens=%d reason=%s time_wanted=%s doing=%s note=%s",
             _decision["thinking"],
             _decision["reaction"],
             _decision["action"],
             _decision["max_tokens"],
             _decision["reason"],
             bool(_REFLEX_TIME_STATE.get("wanted")),
+            (_decision.get("time") or {}).get("doing") or "-",
+            (_decision.get("time") or {}).get("note") or "-",
         )
         # Reflex-only round: the body keeps the tick AND stays silent —
         # quiet action (or the unbreakable fallback quiet) with think=false.

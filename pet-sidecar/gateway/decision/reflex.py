@@ -130,10 +130,15 @@ _REFLEX_SCHEMA: Dict[str, Any] = {
         "reaction": {"type": "string", "enum": ["small", "medium", "large"]},
         "next_check_s": {"type": "integer"},
         "reason": {"type": "string"},
+        # 固定问题 4–6（时间感）：和 1–3 一样是必答项，不是可选的提示词。
+        "time_doing": {"type": "string"},
         "time_relevant": {"type": "boolean"},
         "time_note": {"type": "string"},
     },
-    "required": ["action", "think", "reaction", "next_check_s", "reason", "time_relevant", "time_note"],
+    "required": [
+        "action", "think", "reaction", "next_check_s", "reason",
+        "time_doing", "time_relevant", "time_note",
+    ],
     "additionalProperties": False,
 }
 _RESPONSE_FORMAT: Dict[str, Any] = {
@@ -147,14 +152,23 @@ _RESPONSE_FORMAT: Dict[str, Any] = {
 _SYSTEM_PROMPT = """你是桌宠的快直觉核心（潜意识）。职责：用一次便宜的状态判断决定这一拍怎么过——值得的事才唤醒大脑（主模型），安静的时候就让身体安静待着，不要为了存在感而行动。
 
 输出契约：只输出一个 JSON 对象，字段固定为：
-{"action": "speak"|"look"|"walk"|"quiet"|"other", "think": false, "reaction": "small", "next_check_s": 300, "reason": "不超过20字的中文理由"}
+{"action": "speak"|"look"|"walk"|"quiet"|"other", "think": false, "reaction": "small", "next_check_s": 300, "reason": "不超过20字的中文理由", "time_doing": "刚才我在做什么", "time_relevant": false, "time_note": "过去了多久"}
 - action：这一拍身体做什么。speak=说一句话，look=看一眼周围，walk=走动，quiet=安静待着，other=其它小动作。
 - think：是否唤醒大脑做真正的思考。没有明确理由就是 false。
 - reaction：升级时大脑的持续反应力度。small=简短回应(1536 tok)、medium=中等(2560 tok)、large=深入(4096 tok)。quiet 时选 small。
 - next_check_s：距下次自查的秒数，必须落在当前节奏档内。
 - reason：最关键的一句话，不超过20个中文字；升级（非 quiet/非 think=false）时必须写出理由。
+- time_doing：你之前或者刚刚在做什么？看状态摘要与最近心声，用一行短句回答（不超过20字），不知道就空字符串。
 - time_relevant：这件事跟时间有关吗？只有确实需要知道现在的时间（比如睡觉、等待、日常节奏）才为 true；其他情况 false。系统只在你标记 true 后才把时间给你。
-- time_note：你觉得“之前/刚刚做的事已经过去了多久”的估计（用台账时间戳推）；不知道就留空字符串。
+- time_note：你觉得“之前/刚刚做的事已经过去了多久”的估计（用最近心声的时间线推）；不知道就留空字符串。
+
+【D 的固定问题】（前 3 问决定这一拍，后 3 问决定你的时间感；全部必答）
+1. 这一拍用多强的思考？→ think
+2. 这一拍正文写多长？→ reaction
+3. 接下来最自然的默认动作？→ action
+4. 之前或者刚刚我在做什么？→ time_doing
+5. 我需要知道现在的时间吗？→ time_relevant
+6. 我之前或者刚刚做的事情已经过去了多久？→ time_note
 
 节奏锚定（next_check_s 必须落在当前档位区间内，用户消息会给出当前档位）：
 - slow：240–360 秒；fast：90–150 秒；ultra：50–70 秒。
@@ -295,10 +309,13 @@ def build_user_prompt(state: Mapping[str, Any], tier: str) -> str:
         if len(thoughts) >= _MAX_RECENT_THOUGHTS:
             break
     lines = [
-        "【D 开场的自我提问】（在 time_relevant / time_note 里作答）",
-        "- 之前或者刚刚我在做什么？（看状态摘要与最近心声）",
-        "- 我需要知道现在的时间吗？只有事情跟时间相关才需要——需要时 time_relevant=true。",
-        "- 我之前或者刚刚做的事情已经过去了多久？若重要，用台账的时间戳估计写进 time_note；不知道就留空。",
+        "【D 的固定问题】（4–6 在 time_doing / time_relevant / time_note 里作答）",
+        "1. 这一拍用多强的思考？→ think",
+        "2. 这一拍正文写多长？→ reaction",
+        "3. 接下来最自然的默认动作？→ action",
+        "4. 之前或者刚刚我在做什么？看状态摘要与最近心声；不知道就空着。",
+        "5. 我需要知道现在的时间吗？只有事情跟时间相关才需要——需要时 time_relevant=true。",
+        "6. 我之前或者刚刚做的事情已经过去了多久？若重要，用最近心声的时间线估计写进 time_note；不知道就留空。",
         "【这一拍的状态】",
         f"状态：{summary}",
         f"节奏：{tier}（next_check_s 取 {lo}–{hi} 秒）",
@@ -398,6 +415,7 @@ def _validate_decision(data: Any, tier: str) -> Tuple[Optional[dict], str]:
         time_relevant = raw_time_rel.strip().lower() == "true"
     else:
         time_relevant = bool(raw_time_rel) if raw_time_rel is not None else False
+    time_doing = str(data.get("time_doing") or "").strip()[:_REASON_MAX_CHARS]
     time_note = str(data.get("time_note") or "").strip()[:_REASON_MAX_CHARS]
 
     return {
@@ -406,6 +424,7 @@ def _validate_decision(data: Any, tier: str) -> Tuple[Optional[dict], str]:
         "reaction": reaction,
         "next_check_s": next_check,
         "reason": reason,
+        "time_doing": time_doing,
         "time_relevant": time_relevant,
         "time_note": time_note,
         "source": "reflex",
@@ -419,9 +438,9 @@ def _fallback(tier: str, failure: str) -> dict:
         "action": "quiet",
         "think": False,
         "reaction": "small",
+        "time_doing": "",
         "time_relevant": False,
         "time_note": "",
-        "think": False,
         "next_check_s": (lo + hi) // 2,
         "reason": "",
         "source": "fallback",

@@ -796,6 +796,9 @@ def test_reflex_override_reaches_provider_budget_and_prompt(life, monkeypatch, t
     assert meta["strength"] == "low"
     assert meta["reaction"] == "large"
     assert meta["max_tokens"] == cortex.REACTION_MAX_TOKENS["large"]
+    # 固定问题 4–6 的答案随决策一起落到面板和主脑 prompt 里。
+    assert meta["time_doing"] == ""
+    assert meta["time_relevant"] is False
     # Reflex answers are discrete judgments, not sampled posteriors: no chip.
     assert meta.get("confidence") is None
     # 面板"延迟"报的是真正裁决者（小模型）的整拍耗时，不是 D 那条已经
@@ -924,6 +927,38 @@ def test_time_sense_is_model_requested_and_granted_next_tick(life, monkeypatch, 
     _run(provider, _req(messages=_PROACTIVE))
     assert "current_time" not in calls[2]["state"]
     assert "elapsed_since_main_s" not in calls[2]["state"]
+
+
+def test_time_sense_answers_reach_panel_and_prompt(life, monkeypatch, tmp_path):
+    """固定问题 4–6 的答案要进面板 + 主脑 prompt（不只是内部状态）。"""
+    vitals, ledger = life
+    store = _quiet_store(tmp_path)
+    monkeypatch.setattr(server_mod, "_dstate_provider", lambda: store)
+    _arm(monkeypatch, {
+        "action": "speak", "think": False, "next_check_s": 120,
+        "reaction": "medium", "reason": "想起刚才的事", "source": "reflex",
+        "time_doing": "刚在窗边看光",
+        "time_relevant": True,
+        "time_note": "大约 20 分钟",
+    })
+    provider = _RecordingOpenAI([[
+        {"type": "delta", "content": "嗯。"},
+        {"type": "end"},
+    ]])
+    _install(monkeypatch, provider, passive=_passive(action="quiet"))
+
+    frames = _run(provider, _req(messages=_PROACTIVE))
+
+    assert frames[-1]["event"] == "end"
+    call = provider.calls[0]
+    assert "刚才我在做什么：刚在窗边看光" in call["system"]
+    assert "时间感：需要知道现在的时间；已经过去了 大约 20 分钟" in call["system"]
+    meta = [e for e in brain_mod.snapshot() if e["type"] == "d_decision"][0]["meta"]
+    assert meta["time_doing"] == "刚在窗边看光"
+    assert meta["time_relevant"] is True
+    assert meta["time_note"] == "大约 20 分钟"
+    # 这一拍它要了时间 → 下一拍才会授时（闭环）
+    assert server_mod._REFLEX_TIME_STATE["wanted"] is True
 
 
 def test_time_sense_latch_survives_fallback(life, monkeypatch, tmp_path):

@@ -388,6 +388,10 @@
       addMetaChip(row, "动作", meta.action_label || meta.action);
       addMetaChip(row, "上限", meta.max_tokens);
       addMetaChip(row, "来源", meta.source);
+      // 固定问题 4–6：它记得自己刚才在做什么 / 需不需要时间。
+      addMetaChip(row, "刚才在做", meta.time_doing);
+      if (meta.time_relevant === true) addMetaChip(row, "时间", "需要");
+      addMetaChip(row, "过去", meta.time_note);
       if (hasNumber(meta.latency_ms)) {
         addMetaChip(row, "延迟", formatElapsed(meta.latency_ms));
       }

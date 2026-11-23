@@ -248,7 +248,10 @@ async def test_prefill_contract_request_shape():
     assert body["response_format"]["type"] == "json_schema"
     assert schema["name"] == "reflex"
     assert schema["strict"] is True
-    assert schema["schema"]["required"] == ["action", "think", "reaction", "next_check_s", "reason", "time_relevant", "time_note"]
+    assert schema["schema"]["required"] == [
+        "action", "think", "reaction", "next_check_s", "reason",
+        "time_doing", "time_relevant", "time_note",
+    ]
     assert schema["schema"]["additionalProperties"] is False
     assert schema["schema"]["properties"]["action"]["enum"] == [
         "speak", "look", "walk", "quiet", "other",
@@ -447,6 +450,7 @@ async def test_disabled_config_never_sends_request():
         "action": "quiet",
         "think": False,
         "reaction": "small",
+        "time_doing": "",
         "time_relevant": False,
         "time_note": "",
         "next_check_s": 300,
@@ -520,10 +524,14 @@ def test_user_prompt_is_compact_chinese_lines_not_json():
     assert json.dumps(_NIGHT_STATE, ensure_ascii=False) not in prompt
     # 默认不授时：模型没标 time_relevant 就没有当前时间行
     assert "当前时间：" not in prompt
-    assert "【D 开场的自我提问】" in prompt
-    assert "我需要知道现在的时间吗" in prompt
+    # 时间感是 D 的固定问题 4–6（不再是"开场自我提问"的松散提示）
+    assert "【D 的固定问题】" in prompt
+    assert "4. 之前或者刚刚我在做什么？" in prompt
+    assert "5. 我需要知道现在的时间吗" in prompt
+    assert "6. 我之前或者刚刚做的事情已经过去了多久" in prompt
+    assert "time_doing" in prompt
     lines = [line for line in prompt.split("\n") if line]
-    assert len(lines) == 12
+    assert len(lines) == 15
 
 
 def test_time_line_only_appears_when_model_asked_for_time():

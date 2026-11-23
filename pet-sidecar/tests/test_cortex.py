@@ -427,6 +427,50 @@ def test_decision_to_prompt_has_all_fields_and_slow_tool_hint():
     assert "pet_enter_slow" in prompt
     assert "用户直接说话必须回应" in prompt
     assert "绝不能出现在提示里" not in prompt
+    # 没有时间感答案时不占字数（多一行就是噪音）
+    assert "刚才我在做什么" not in prompt
+    assert "时间感：" not in prompt
+
+
+def test_fixed_question_order_is_three_choices_plus_time_sense():
+    """D 的固定问题 = 思考/篇幅/动作 + 时间感三问（共 6 个）。"""
+    assert cortex.FIXED_QUESTION_ORDER == (
+        "thinking", "reaction", "action",
+        "time_doing", "time_relevant", "time_note",
+    )
+    for qid in cortex.FIXED_QUESTION_ORDER:
+        assert qid in cortex._QUESTION_SPECS
+
+
+def test_decision_to_prompt_prints_time_sense_answers():
+    """固定问题 4–6 答了就要出现在主脑 prompt 里（它才知道自己刚在做什么）。"""
+    prompt = decision_to_prompt({
+        "strength": "no_thinking",
+        "reaction": "small",
+        "max_tokens": 2048,
+        "action": "quiet",
+        "action_label": "安静",
+        "time": {
+            "doing": "刚在整理记忆",
+            "relevant": True,
+            "note": "大约 20 分钟",
+        },
+    })
+    assert "刚才我在做什么：刚在整理记忆" in prompt
+    assert "时间感：需要知道现在的时间；已经过去了 大约 20 分钟" in prompt
+
+
+def test_decision_to_prompt_time_note_without_relevance():
+    prompt = decision_to_prompt({
+        "strength": "no_thinking",
+        "reaction": "small",
+        "max_tokens": 2048,
+        "action": "quiet",
+        "action_label": "安静",
+        "time": {"doing": "", "relevant": False, "note": "5 分钟"},
+    })
+    assert "刚才我在做什么" not in prompt
+    assert "时间感：已经过去了 5 分钟" in prompt
 
 
 @pytest.mark.asyncio
