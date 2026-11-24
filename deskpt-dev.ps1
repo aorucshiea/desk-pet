@@ -119,6 +119,26 @@ try {
 Write-Host "      Waiting for sidecar health..." -ForegroundColor Gray
 $healthy = $false
 $startTime = Get-Date
+# When the wait drags on, surface the sidecar's own log so the stall is
+# diagnosable from THIS terminal instead of needing to hunt log files.
+# Two different stalls matter: the sidecar never being spawned (Electron
+# main is still doing blocking init) vs. the sidecar being up but stuck.
+$logDir = Join-Path $env:APPDATA "deskpt\logs"
+$internalLog = Join-Path $logDir "sidecar-internal.log"
+$hostLog = Join-Path $logDir "sidecar.log"
+function Show-SidecarLogTail {
+    param([int]$lines = 12)
+    foreach ($f in @($hostLog, $internalLog)) {
+        if (Test-Path $f) {
+            Write-Host "  --- tail: $(Split-Path $f -Leaf) ---" -ForegroundColor DarkGray
+            Get-Content $f -Tail $lines -ErrorAction SilentlyContinue | ForEach-Object {
+                $t = $_.ToString()
+                if ($t.Length -gt 200) { $t = $t.Substring(0, 200) + "…" }
+                Write-Host "    $t" -ForegroundColor DarkGray
+            }
+        }
+    }
+}
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 2
     try {
@@ -131,12 +151,17 @@ for ($i = 0; $i -lt 30; $i++) {
         if (($i + 1) % 5 -eq 0) {
             $elapsed = [math]::Round(((Get-Date) - $startTime).TotalSeconds)
             Write-Host "  still waiting... (${elapsed}s)" -ForegroundColor DarkGray
+            # After ~20s with no answer, print the log tail once to show why.
+            if ($elapsed -ge 20 -and ($i + 1) % 10 -eq 0) {
+                Show-SidecarLogTail -lines 10
+            }
         }
     }
 }
 if (-not $healthy) {
     Write-Host "[WARN] Sidecar did not answer within 60s." -ForegroundColor Yellow
     Write-Host "       Check the pet's own log: %LOCALAPPDATA%\deskpt\logs\" -ForegroundColor Yellow
+    Show-SidecarLogTail -lines 15
 }
 
 Write-Host "Done. Pet should appear on desktop." -ForegroundColor Green

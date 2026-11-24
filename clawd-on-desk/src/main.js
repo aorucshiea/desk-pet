@@ -3652,6 +3652,29 @@ if (!gotTheLock) {
       return;
     }
 
+    // Start the Python sidecar EARLY, in parallel with the rest of startup.
+    // The sidecar spawn used to be scheduled at the END of this handler
+    // (+500ms), which meant it only ran after all the blocking init below
+    // (19-agent registry + hook sync, settings, plugins, MCP, hardware
+    // adapter…). When that init was slow the launcher sat on "Waiting for
+    // sidecar health…" for the full 60s while the sidecar hadn't even been
+    // spawned yet. The spawn is independent of those steps, so kick it off
+    // right after the cheap settings hydration and let it boot concurrently.
+    // Only the SPAWN is moved early: the language/theme-dependent boot-wake
+    // still happens in the late `warmup()` below. `ensureRunning` is
+    // idempotent, so the later warmup is a no-op once this already started it.
+    if (!shouldShowDeskPetOnboarding) {
+      try {
+        if (_petChat && typeof _petChat.ensureSidecarReady === "function") {
+          void Promise.resolve(_petChat.ensureSidecarReady()).catch((err) => {
+            console.warn("Clawd: early sidecar spawn failed:", err && err.message);
+          });
+        }
+      } catch (err) {
+        console.warn("Clawd: early sidecar spawn failed:", err && err.message);
+      }
+    }
+
     // Import system-backed settings (openAtLogin) into prefs on first run.
     // Must run before createWindow() so the first menu draw sees the
     // hydrated value rather than the schema default.
