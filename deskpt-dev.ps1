@@ -1,4 +1,4 @@
-# deskpt-dev.ps1 - Quick launch dev environment (self-bootstrapping)
+﻿# deskpt-dev.ps1 - Quick launch dev environment (self-bootstrapping)
 # Usage: .\deskpt-dev.ps1   (or double-click deskpt-dev.bat)
 #
 # First run: automatically creates the Python venv, installs gateway deps,
@@ -133,7 +133,7 @@ function Show-SidecarLogTail {
             Write-Host "  --- tail: $(Split-Path $f -Leaf) ---" -ForegroundColor DarkGray
             Get-Content $f -Tail $lines -ErrorAction SilentlyContinue | ForEach-Object {
                 $t = $_.ToString()
-                if ($t.Length -gt 200) { $t = $t.Substring(0, 200) + "…" }
+                if ($t.Length -gt 200) { $t = $t.Substring(0, 200) + "..." }
                 Write-Host "    $t" -ForegroundColor DarkGray
             }
         }
