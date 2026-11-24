@@ -3657,6 +3657,24 @@ if (!gotTheLock) {
     // (+500ms), which meant it only ran after all the blocking init below
     // (19-agent registry + hook sync, settings, plugins, MCP, hardware
     // adapter…). When that init was slow the launcher sat on "Waiting for
+    // Import system-backed settings (openAtLogin) into prefs on first run.
+    // Must run before createWindow() so the first menu draw sees the
+    // hydrated value rather than the schema default.
+    hydrateSystemBackedSettings();
+    lang = resolveEffectiveLang(storedLang, () => app.getLocale());
+
+    permDebugLog = path.join(app.getPath("userData"), "permission-debug.log");
+    sessionDebugLog = path.join(app.getPath("userData"), "session-debug.log");
+    focusDebugLog = path.join(app.getPath("userData"), "focus-debug.log");
+    initTelegramMigrationController().catch((err) => {
+      console.warn("Clawd: migration controller init failed:", err && err.message);
+    });
+    const shouldShowDeskPetOnboarding = _petOnboarding && _petOnboarding.shouldShow();
+    // Start the Python sidecar EARLY, in parallel with the rest of startup.
+    // The sidecar spawn used to be scheduled at the END of this handler
+    // (+500ms), which meant it only ran after all the blocking init below
+    // (19-agent registry + hook sync, settings, plugins, MCP, hardware
+    // adapter…). When that init was slow the launcher sat on "Waiting for
     // sidecar health…" for the full 60s while the sidecar hadn't even been
     // spawned yet. The spawn is independent of those steps, so kick it off
     // right after the cheap settings hydration and let it boot concurrently.
@@ -3674,20 +3692,6 @@ if (!gotTheLock) {
         console.warn("Clawd: early sidecar spawn failed:", err && err.message);
       }
     }
-
-    // Import system-backed settings (openAtLogin) into prefs on first run.
-    // Must run before createWindow() so the first menu draw sees the
-    // hydrated value rather than the schema default.
-    hydrateSystemBackedSettings();
-    lang = resolveEffectiveLang(storedLang, () => app.getLocale());
-
-    permDebugLog = path.join(app.getPath("userData"), "permission-debug.log");
-    sessionDebugLog = path.join(app.getPath("userData"), "session-debug.log");
-    focusDebugLog = path.join(app.getPath("userData"), "focus-debug.log");
-    initTelegramMigrationController().catch((err) => {
-      console.warn("Clawd: migration controller init failed:", err && err.message);
-    });
-    const shouldShowDeskPetOnboarding = _petOnboarding && _petOnboarding.shouldShow();
     if (shouldShowDeskPetOnboarding) {
       _petOnboarding.open();
     } else {
