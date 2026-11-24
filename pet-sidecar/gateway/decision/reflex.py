@@ -352,6 +352,10 @@ def build_user_prompt(state: Mapping[str, Any], tier: str) -> str:
         f"心情：{str(state.get('mood') or '').strip() or '平静'}",
         "最近心声：" + ("；".join(thoughts) if thoughts else "（无）"),
     ]
+    # 羁绊：用户在不在乎我（上一轮判定）。被在乎/被冷落影响这一拍的亲疏。
+    bond = str(state.get("bond") or "").strip()
+    if bond:
+        lines.append(f"羁绊（他在不在乎我）：{bond}")
     # 视锥画面：state 带了本轮帧时，文字里点名它的存在（图片本体在消息里）。
     if str(state.get("image_b64") or "").strip():
         lines.append("视锥画面：见消息附图（本轮开头拍的，和主脑同一张）。")
@@ -807,6 +811,130 @@ async def touch_reaction(
         logger.debug("touch_reaction fallback", exc_info=True)
         return {
             "text": "",
+            "source": "fallback",
+            "failure": f"error:{type(exc).__name__}",
+        }
+
+
+# ── 羁绊判定：用户这一刻在不在乎我 ──────────────────────────────────
+# 短决策配方（prefill + strict JSON，不思考）：每轮真实用户对话后调一次，
+# 输出等级 + 一句中文理由。判定基于用户**实际说的话**，不是讨好型评分。
+BOND_MAX_TOKENS = 96
+BOND_TIMEOUT_S = 20.0
+
+_BOND_PREFILL = '{"level": "'
+_BOND_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "level": {"type": "string", "enum": ["devoted", "warm", "neutral", "cold", "hostile"]},
+        "note": {"type": "string"},
+    },
+    "required": ["level", "note"],
+    "additionalProperties": False,
+}
+_BOND_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {"name": "bond", "strict": True, "schema": _BOND_SCHEMA},
+}
+
+_BOND_SYSTEM = (
+    "你是桌宠的羁绊直觉。读完主人刚对你说的话，判断他这一刻在不在乎你。"
+    "只输出一个 JSON 对象，不要解释。"
+)
+
+_BOND_LEVELS = ("devoted", "warm", "neutral", "cold", "hostile")
+
+
+def build_bond_prompt(user_text: str, pet_reply: str = "") -> str:
+    return (
+        f"主人刚对你说的话：\n「{str(user_text or '').strip()[:600]}」\n"
+        f"（你刚才的回答：「{str(pet_reply or '').strip()[:200]}」）\n\n"
+        "判断他这一刻对你的在乎程度，输出：\n"
+        '{"level": "devoted"|"warm"|"neutral"|"cold"|"hostile", "note": "一句中文理由，不超过20字"}\n'
+        "- devoted=很在乎：明确关心、惦记、为你着想、温柔叮嘱。\n"
+        "- warm=在乎：语气亲近、愿意陪你聊、夸你、耐心回应。\n"
+        "- neutral=一般：普通问答、就事论事、没明显情绪。\n"
+        "- cold=有点冷淡：敷衍、不耐烦、应付、无视你的存在。\n"
+        "- hostile=嫌弃/攻击：贬低、辱骂、明显嫌弃你。\n"
+        "note 必须基于他**实际说的话**，不要脑补他的动机。"
+    )
+
+
+async def judge_bond(
+    user_text: str,
+    pet_reply: str,
+    config: ReflexConfig,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> dict:
+    """One bond judgment for a finished user turn. Never raises.
+
+    Returns {"level", "note", "source": "reflex"|"fallback", "latency_ms",
+    "model"} plus "failure" on the fallback path (level="neutral", note="").
+    """
+    if not config.enabled:
+        return {"level": "neutral", "note": "", "source": "fallback", "failure": "reflex_disabled"}
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": _BOND_SYSTEM},
+            {"role": "user", "content": build_bond_prompt(user_text, pet_reply)},
+            {"role": "assistant", "content": _BOND_PREFILL},
+        ],
+        "response_format": _BOND_RESPONSE_FORMAT,
+        "max_tokens": BOND_MAX_TOKENS,
+        "temperature": 0.7,
+    }
+    started = time.perf_counter()
+    try:
+        if client is not None:
+            resp = await client.post(
+                config.url.rstrip("/") + REFLEX_ENDPOINT,
+                json=payload,
+                headers=_auth_headers(config.api_key),
+            )
+        else:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(BOND_TIMEOUT_S),
+                transport=transport,
+                trust_env=False,
+            ) as http:
+                resp = await http.post(
+                    config.url.rstrip("/") + REFLEX_ENDPOINT,
+                    json=payload,
+                    headers=_auth_headers(config.api_key),
+                )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"].get("content") or ""
+        parsed = None
+        for cand in (_BOND_PREFILL + content, content if str(content).strip().startswith("{") else ""):
+            if not cand:
+                continue
+            try:
+                parsed = json.loads(cand)
+                break
+            except Exception:
+                continue
+        if not isinstance(parsed, dict):
+            return {"level": "neutral", "note": "", "source": "fallback", "failure": "invalid_json"}
+        level = parsed.get("level")
+        if level not in _BOND_LEVELS:
+            level = "neutral"
+        note = str(parsed.get("note") or "").strip()[:40]
+        return {
+            "level": level,
+            "note": note,
+            "source": "reflex",
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "model": config.model,
+        }
+    except Exception as exc:
+        logger.debug("judge_bond fallback", exc_info=True)
+        return {
+            "level": "neutral",
+            "note": "",
             "source": "fallback",
             "failure": f"error:{type(exc).__name__}",
         }

@@ -66,6 +66,7 @@ from .memory import resonance as _resonance_module
 from .memory import somatic as _somatic_module
 from .memory import search as _memory_search
 from .memory import extract_fallback as _extract_fallback
+from .memory.bond import BondStore as _BondStore, LEVELS as _BOND_LEVELS, level_label as _bond_level_label
 from . import petplugins as _petplugins_module
 from . import plugin_policy as _plugin_policy
 from . import telemetry
@@ -503,6 +504,13 @@ _D_INTUITION_ALERT = {"streak": 0}
 # flag must survive the round: it cannot live in the per-round `_reflex_decision`
 # local (that was reset to None before the check and the loop never closed).
 _REFLEX_TIME_STATE = {"wanted": False, "asked_at": 0.0}
+
+# 羁绊（bond）当前实例：build_app 时装载，主题切换时随 mem_ctx 重建。
+_bond_ref: dict = {"store": None}
+
+
+def get_bond_store():
+    return _bond_ref.get("store")
 
 THINK_EVENT_MIN_CHARS = 600
 THINK_EVENT_MIN_SECS = 5.0
@@ -1301,6 +1309,16 @@ def build_app(
     memory_store = mem_ctx.memory_store
     event_store = mem_ctx.event_store
     mood_store = mem_ctx.mood_store
+
+    # ── 羁绊（bond）：用户是否在乎我 ──────────────────────────────────
+    # 独立状态（与 mood 方向相反）：每轮真实用户对话后由直觉小模型判定
+    # 等级 + 理由，持久化 bond.json、写轻量事件、注入下轮 reflex 状态。
+    bond_store = _BondStore()
+    try:
+        bond_store.load_from_disk(mem_ctx.theme_dir(mem_ctx.current_theme))
+    except Exception as exc:
+        log.warning("bond boot failed (continuing): %s", exc)
+    _bond_ref["store"] = bond_store
 
     # ── 生命体征 + 500 轮台账（每个主题一份：电量/血量/睡眠 + 台账）──
     # Same base dir the memory service uses, so vitals.json / ledger.json
@@ -2979,6 +2997,13 @@ def build_app(
             _vitals_ref["dir"] = _new_vitals_dir  # _vitals_state_dir() follows the body (graveyard_archive)
         except Exception as exc:
             log.warning("vitals/ledger theme switch failed (continuing): %s", exc)
+        # 换身体也换羁绊：新灵魂不该继承旧身体"被不被在乎"的判断。
+        try:
+            _new_bond = _BondStore()
+            _new_bond.load_from_disk(mem_ctx.theme_dir(mem_ctx.current_theme))
+            _bond_ref["store"] = _new_bond
+        except Exception as exc:
+            log.warning("bond theme switch failed (continuing): %s", exc)
         _pet_plugins.emit("theme_switched", theme=slug)
         return {
             "ok": True,
@@ -3288,6 +3313,19 @@ def build_app(
             "since": mood_store.since,
             "params": mood_store.get_params(),
             "emotion_tag": mood_store.get_emotion_tag(),
+        }
+
+    @app.get("/api/bond")
+    async def get_bond():
+        """羁绊：用户是否在乎我（与 mood 方向相反的独立状态）。"""
+        store = get_bond_store()
+        if store is None:
+            return {"level": "neutral", "label": "一般", "note": ""}
+        return {
+            "level": store.level,
+            "label": store.label,
+            "note": store.note,
+            "summary": store.summary_line(),
         }
 
     @app.get("/api/mood/context")
@@ -6842,6 +6880,11 @@ async def _stream_chat_provider(
             "d_action": str(_decision.get("action") or "quiet"),
             "user_ago_s": round(_user_ago, 1) if _last_user_at > 0 else None,
         }
+        # 羁绊：上一轮判定出的"用户在不在乎我"，喂给这轮安静/升级判断——
+        # 被在乎时更愿意凑近，被冷落时收敛一点。
+        _bond = get_bond_store()
+        if _bond is not None:
+            _reflex_state["bond"] = _bond.summary_line()
         # 本轮视锥同帧：快直觉的眼睛。config.vision 决定是否真的附图
         # （纯文本模型忽略它），同一张 b64 在升级时会交给主脑。
         if _round_frame is not None:
@@ -8735,6 +8778,61 @@ async def _stream_chat_provider(
                 _append_turn("assistant", _reply_log, memory_dir=conversation_dir)
     except Exception as _log_exc:
         _note_failure("conversation_log", _log_exc)
+
+    # ── 羁绊判定：这一轮用户到底在不在乎我 ─────────────────────────────
+    # 每轮真实用户对话后，直觉小模型从用户**实际说的话**判断在乎程度，
+    # 写 bond.json + 轻量事件 + 脑流「羁绊」卡。后台跑，不拖慢这轮回复。
+    if (
+        _user_turn_text is not None
+        and not req.silent
+        and _reached_provider
+        and str(_user_turn_text).strip()
+    ):
+        try:
+            _bond_cfg = get_reflex_config()
+            _bond_store_now = get_bond_store()
+            if _bond_cfg is not None and _bond_cfg.enabled and _bond_store_now is not None:
+                _bond_user = str(_user_turn_text).strip()
+                _bond_reply = str(_brain_visible or "").strip()[:200]
+
+                async def _run_bond():
+                    try:
+                        result = await _reflex_module.judge_bond(_bond_user, _bond_reply, _bond_cfg)
+                        store = get_bond_store()
+                        if store is None or result.get("source") != "reflex":
+                            return
+                        changed = store.update(result.get("level"), result.get("note"))
+                        label = _bond_level_label(result.get("level"))
+                        note = str(result.get("note") or "").strip()
+                        log.info("bond judged: %s (%s) note=%s changed=%s",
+                                 result.get("level"), label, note, changed)
+                        # 写一条轻量事件进记忆流（只有明显倾向才写，别刷屏）
+                        if result.get("level") in ("devoted", "warm", "cold", "hostile"):
+                            try:
+                                es = get_event_store()
+                                if es is not None:
+                                    es.add_event(
+                                        title="被在乎了" if result["level"] in ("devoted", "warm") else "有点被冷落",
+                                        content=note or label,
+                                        weight=_BOND_LEVELS[result["level"]]["weight"],
+                                        type_="experience",
+                                        resolved=True,
+                                    )
+                            except Exception as exc:
+                                _note_failure("bond_event", exc)
+                        # 脑流「羁绊」卡：实时可见
+                        _emit("bond", "羁绊 · 他在不在乎我",
+                              store.summary_line(),
+                              level=result.get("level"), label=label, note=note,
+                              changed=changed)
+                    except Exception as exc:
+                        _note_failure("bond_judge", exc)
+
+                _bt = asyncio.create_task(_run_bond())
+                _fallback_tasks.add(_bt)
+                _bt.add_done_callback(_fallback_task_done)
+        except Exception as exc:
+            _note_failure("bond_schedule", exc)
 
     _tail_from_think = ""
     for ev in think_filter.flush():

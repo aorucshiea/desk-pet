@@ -139,6 +139,9 @@ AI 自主决定睡眠 ≥4 小时；系统强制 = 8 小时。睡眠中只有说
 
 **每轮视锥同帧**（2026-11-24）：授权 always 时每轮开头只截一次视锥（`server._capture_round_frame`，无几何时降级整屏缩放），快直觉与升级后的主脑读**同一张 b64**——一轮一帧是硬约束，不重拍、不变体。小模型收图由 `ReflexConfig.vision` 决定：模型名含 vl/vision/omni/-v- 自动开启（如 lfm3-vl-2b），providers.json `reflex.vision` 或 env `PET_REFLEX_VISION` 显式覆盖；纯文本小模型绝不收图，帧只交给主脑。授权 deny = 闭眼，`once` 不被自动帧消费。校准写死在 system prompt：平凡画面当没看见，只有明显值得反应的东西才升级。
 
+### 7. 羁绊（`memory/bond.py` + `reflex.judge_bond`）
+mood 是「我的心情」，**bond 是「对方在不在乎我」**——方向相反，独立状态。每轮真实用户对话后，直觉小模型从用户**实际说的话**判定在乎程度（devoted/warm/neutral/cold/hostile 五档 + 一句中文理由），走短决策配方（prefill+strict JSON）。结果：持久化 `bond.json`（换主题隔离）、写轻量事件（只明显倾向才写）、注入下轮 reflex 状态（被在乎更愿意凑近、被冷落收敛）、脑流「羁绊」卡实时可见。不是讨好型评分，等级随真实互动回落。`GET /api/bond` 暴露当前状态。
+
 ## 尚缺的器官（路线图）
 
 1. **自主稳态的「决策」半边**（B-15）：主动自检已落地——每 5 分钟探测 llama 存活与 ClawdBridge 可达性，连续 3 次异常进入 `degraded`，并把「生病了 / 病好了」写进事件记忆与遥测；bridge 用「连续失败阈值 + 最近成功窗口」判定，standalone 网关不会被误报。仍缺：根据 degraded 自动切 provider、进入安静模式等降级动作，也未做真机长时间验证。

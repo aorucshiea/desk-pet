@@ -17,6 +17,7 @@
     provider: { label: "模型" },
     summary: { label: "总结" },
     d_decision: { label: "D" },
+    bond: { label: "羁绊" },
     prompt: { label: "提示" },
     first_token: { label: "首字" },
     think: { label: "思考" },
@@ -398,6 +399,9 @@
       if (hasNumber(meta.confidence)) {
         addMetaChip(row, "置信", formatPercent(meta.confidence));
       }
+    } else if (event.type === "bond") {
+      addMetaChip(row, "在乎程度", meta.label);
+      if (meta.changed === true) addMetaChip(row, "", "有变化");
     } else if (event.type === "provider") {
       addMetaChip(row, "提供方", meta.provider);
       addMetaChip(row, "模型", meta.model);
